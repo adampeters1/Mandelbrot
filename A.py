@@ -1,572 +1,752 @@
 """
-Interactive Mandelbrot Set Visualization with PyQt5
+Interactive Mandelbrot Set Viewer
 
-This module provides an interactive viewer for the Mandelbrot set with
-scroll-based zooming centered on the mouse cursor position, with threaded
-computation to prevent UI locking.
+A PyQt6-based interactive viewer with threaded computation, scroll-wheel zooming
+centred on mouse position, and precision limit detection.
 """
-
-import sys
 import numpy as np
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
-from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget
-from PyQt5.QtCore import QThread, pyqtSignal, QPoint, Qt
-from PyQt5.QtGui import QImage, QPixmap, QPainter
-from PIL import Image
+from collections import OrderedDict
+import hashlib
+
+from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
+from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtWidgets import QLabel
+from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QWheelEvent
+import math
+from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition
+from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QWheelEvent
+
+
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Warning: numba not available. Install with 'pip install numba' for better performance.")
+    # Fallback decorator that does nothing
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
+
 
 
 @dataclass
 class ViewState:
-   """Represents the current view into the complex plane."""
-   center_x: float
-   center_y: float
-   width: float  # Width in complex plane units
-   height: float  # Height in complex plane units
-   pixel_width: int
-   pixel_height: int
-   max_iterations: int = 256
-   
-   def copy(self):
-       """Create a copy of this view state."""
-       return ViewState(
-           self.center_x,
-           self.center_y,
-           self.width,
-           self.height,
-           self.pixel_width,
-           self.pixel_height,
-           self.max_iterations
-       )
-   
-   @property
-   def x_min(self) -> float:
-       return self.center_x - self.width / 2
-   
-   @property
-   def x_max(self) -> float:
-       return self.center_x + self.width / 2
-   
-   @property
-   def y_min(self) -> float:
-       return self.center_y - self.height / 2
-   
-   @property
-   def y_max(self) -> float:
-       return self.center_y + self.height / 2
+    """Represents the current view into the complex plane."""
+    centre_real: float = -0.5
+    centre_imag: float = 0.0
+    zoom_level: float = 1.0
+    
+    initial_width: float = 3.5
+    initial_height: float = 2.5
+    
+    @property
+    def current_width(self) -> float:
+        return self.initial_width / self.zoom_level
+    
+    @property
+    def current_height(self) -> float:
+        return self.initial_height / self.zoom_level
+    
+    @property
+    def x_min(self) -> float:
+        return self.centre_real - self.current_width / 2
+    
+    @property
+    def x_max(self) -> float:
+        return self.centre_real + self.current_width / 2
+    
+    @property
+    def y_min(self) -> float:
+        return self.centre_imag - self.current_height / 2
+    
+    @property
+    def y_max(self) -> float:
+        return self.centre_imag + self.current_height / 2
+    
+    def pixel_to_complex(self, pixel_x: int, pixel_y: int, 
+                         image_width: int, image_height: int) -> tuple[float, float]:
+        real = self.x_min + (pixel_x / image_width) * self.current_width
+        imag = self.y_max - (pixel_y / image_height) * self.current_height
+        return real, imag
+    
+    def copy(self) -> 'ViewState':
+        return ViewState(
+            centre_real=self.centre_real,
+            centre_imag=self.centre_imag,
+            zoom_level=self.zoom_level,
+            initial_width=self.initial_width,
+            initial_height=self.initial_height
+        )
+    
+    def get_cache_key(self, width: int, height: int, max_iter: int) -> str:
+        """Generate a unique key for caching this view."""
+        # Round to avoid floating point precision issues in cache lookup
+        key_str = f"{self.centre_real:.15e}_{self.centre_imag:.15e}_{self.zoom_level:.15e}_{width}_{height}_{max_iter}"
+        return hashlib.md5(key_str.encode()).hexdigest()
 
 
-def create_complex_matrix(view: ViewState) -> np.ndarray:
-   """
-   Create a complex matrix representing points in the complex plane.
-   
-   Args:
-       view: ViewState object containing the bounds and resolution.
-       
-   Returns:
-       A 2D numpy array of complex numbers representing the complex plane.
-   """
-   real_values = np.linspace(view.x_min, view.x_max, view.pixel_width)
-   imag_values = np.linspace(view.y_max, view.y_min, view.pixel_height)
-   
-   real_grid, imag_grid = np.meshgrid(real_values, imag_values)
-   complex_matrix = real_grid + 1j * imag_grid
-   
-   return complex_matrix
+@dataclass
+class RenderConfig:
+    """Configuration for rendering."""
+    width: int = 800
+    height: int = 600
+    max_iterations: int = 256
+    min_pixel_spacing: float = field(default_factory=lambda: np.finfo(np.float64).eps * 1000)
+    
+    # Progressive rendering settings
+    enable_progressive: bool = True
+    preview_scale: int = 4  # Render at 1/4 resolution first
+    
+    # Cache settings
+    cache_size: int = 10  # Number of views to cache
+    
+    # Adaptive iteration depth
+    adaptive_iterations: bool = True
+    base_iterations: int = 128
+    iteration_zoom_factor: float = 1.5  # Increase iterations by this factor per 10x zoom
+    max_adaptive_iterations: int = 4096
+    
+    def get_iterations_for_zoom(self, zoom_level: float) -> int:
+        """Calculate appropriate iteration count based on zoom level."""
+        if not self.adaptive_iterations:
+            return self.max_iterations
+        
+        # Logarithmic scaling: more detail needed at higher zoom
+        zoom_exponent = math.log10(max(1.0, zoom_level))
+        iterations = int(self.base_iterations * (self.iteration_zoom_factor ** zoom_exponent))
+        
+        return min(iterations, self.max_adaptive_iterations)
 
 
-def naive_escape_time_algorithm_vectorized(complex_matrix: np.ndarray, 
-                                          max_iterations: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-   """
-   Vectorized naive escape time algorithm using real number arithmetic with NumPy.
-   
-   This simulates complex number operations using two real number arrays:
-       x_{n+1} = x_n^2 - y_n^2 + x_0
-       y_{n+1} = 2 * x_n * y_n + y_0
-   
-   Escape condition: x^2 + y^2 > 4
-   
-   Args:
-       complex_matrix: 2D array of complex numbers to test.
-       max_iterations: Maximum iterations before assuming point is in set.
-       
-   Returns:
-       Tuple of (iterations, final_x, final_y) arrays for smooth coloring.
-   """
-   height, width = complex_matrix.shape
-   
-   # Extract real and imaginary parts (these are our x0 and y0)
-   x0 = np.real(complex_matrix)
-   y0 = np.imag(complex_matrix)
-   
-   # Initialize iteration variables
-   x = np.zeros_like(x0, dtype=np.float64)
-   y = np.zeros_like(y0, dtype=np.float64)
-   
-   # Track iteration counts
-   iterations = np.zeros((height, width), dtype=np.int32)
-   
-   # Mask for points that haven't escaped yet
-   not_escaped = np.ones((height, width), dtype=bool)
-   
-   for i in range(max_iterations):
-       # Compute x^2 and y^2 (naive approach - computing separately)
-       x_squared = x * x
-       y_squared = y * y
-       
-       # Check escape condition: x^2 + y^2 > 4
-       magnitude_squared = x_squared + y_squared
-       escaped = not_escaped & (magnitude_squared > 4.0)
-       
-       # Record iteration count for newly escaped points
-       iterations[escaped] = i
-       
-       # Update mask
-       not_escaped[escaped] = False
-       
-       # If all points have escaped, we can exit early
-       if not np.any(not_escaped):
-           break
-       
-       # Compute next iteration using real arithmetic
-       # new_x = x^2 - y^2 + x0
-       # new_y = 2xy + y0
-       new_x = x_squared - y_squared + x0
-       new_y = 2.0 * x * y + y0
-       
-       # Update only points that haven't escaped
-       x = new_x
-       y = new_y
-   
-   # Points that never escaped remain at max_iterations
-   iterations[not_escaped] = max_iterations
-   
-   return iterations, x, y
+class ViewCache:
+    """LRU cache for computed Mandelbrot views."""
+    
+    def __init__(self, max_size: int = 10):
+        self.max_size = max_size
+        self.cache: OrderedDict[str, np.ndarray] = OrderedDict()
+    
+    def get(self, key: str) -> Optional[np.ndarray]:
+        """Retrieve cached view, moving it to end (most recently used)."""
+        if key in self.cache:
+            # Move to end to mark as recently used
+            self.cache.move_to_end(key)
+            return self.cache[key].copy()
+        return None
+    
+    def put(self, key: str, value: np.ndarray) -> None:
+        """Store view in cache, evicting oldest if necessary."""
+        if key in self.cache:
+            # Update existing entry
+            self.cache.move_to_end(key)
+            self.cache[key] = value.copy()
+        else:
+            # Add new entry
+            if len(self.cache) >= self.max_size:
+                # Remove oldest (first) item
+                self.cache.popitem(last=False)
+            self.cache[key] = value.copy()
+    
+    def clear(self) -> None:
+        """Clear all cached data."""
+        self.cache.clear()
+
+# Numba-optimized computation kernel
+@jit(nopython=True, parallel=True, cache=True)
+def _mandelbrot_kernel_numba(real_vals, imag_vals, max_iterations):
+    """
+    Highly optimized Mandelbrot computation using Numba JIT compilation.
+    
+    This function is compiled to native machine code with parallel execution
+    across CPU cores.
+    """
+    height = len(imag_vals)
+    width = len(real_vals)
+    iterations = np.zeros((height, width), dtype=np.float64)
+    
+    # Parallel loop over rows
+    for py in prange(height):
+        c_imag = imag_vals[py]
+        
+        for px in range(width):
+            c_real = real_vals[px]
+            
+            # Initialize z
+            z_real = 0.0
+            z_imag = 0.0
+            
+            iteration = 0
+            
+            # Iteration loop
+            while iteration < max_iterations:
+                z_real_sq = z_real * z_real
+                z_imag_sq = z_imag * z_imag
+                
+                # Check escape condition
+                if z_real_sq + z_imag_sq > 4.0:
+                    # Smooth coloring
+                    magnitude = math.sqrt(z_real_sq + z_imag_sq)
+                    if magnitude > 1.0:
+                        log_zn = math.log(magnitude)
+                        if log_zn > 0:
+                            smooth_val = iteration + 1 - math.log(log_zn) / math.log(2.0)
+                            iterations[py, px] = smooth_val
+                            break
+                    iterations[py, px] = float(iteration)
+                    break
+                
+                # z = z^2 + c
+                new_real = z_real_sq - z_imag_sq + c_real
+                new_imag = 2.0 * z_real * z_imag + c_imag
+                
+                z_real = new_real
+                z_imag = new_imag
+                iteration += 1
+            
+            # Didn't escape
+            if iteration == max_iterations:
+                iterations[py, px] = float(max_iterations)
+    
+    return iterations
+
+def compute_mandelbrot_optimized(view: ViewState, config: RenderConfig, 
+                                  width: int = None, height: int = None) -> np.ndarray:
+    """
+    Optimized Mandelbrot computation with adaptive parameters.
+    
+    Uses Numba JIT compilation for native performance with parallel execution.
+    Supports variable resolution for progressive rendering.
+    
+    Args:
+        view: Current view state.
+        config: Rendering configuration.
+        width: Optional width override for progressive rendering.
+        height: Optional height override for progressive rendering.
+        
+    Returns:
+        2D array of normalized iteration counts.
+    """
+    if width is None:
+        width = config.width
+    if height is None:
+        height = config.height
+    
+    # Get adaptive iteration count based on zoom level
+    max_iterations = config.get_iterations_for_zoom(view.zoom_level)
+    
+    # Create coordinate arrays
+    real_vals = np.linspace(view.x_min, view.x_max, width, dtype=np.float64)
+    imag_vals = np.linspace(view.y_max, view.y_min, height, dtype=np.float64)
+    
+    if NUMBA_AVAILABLE:
+        # Use highly optimized Numba kernel
+        iterations = _mandelbrot_kernel_numba(real_vals, imag_vals, max_iterations)
+    else:
+        # Fallback to vectorized NumPy (slower but still functional)
+        iterations = _compute_mandelbrot_numpy_fallback(real_vals, imag_vals, max_iterations)
+    
+    return iterations
+
+def _compute_mandelbrot_numpy_fallback(real_vals, imag_vals, max_iterations):
+    """Fallback NumPy implementation when Numba is not available."""
+    height = len(imag_vals)
+    width = len(real_vals)
+    
+    real_grid, imag_grid = np.meshgrid(real_vals, imag_vals)
+    
+    c_real = real_grid.copy()
+    c_imag = imag_grid.copy()
+    
+    z_real = np.zeros_like(c_real)
+    z_imag = np.zeros_like(c_imag)
+    
+    iterations = np.zeros((height, width), dtype=np.float64)
+    not_escaped = np.ones((height, width), dtype=bool)
+    
+    for i in range(max_iterations):
+        z_real_squared = z_real[not_escaped] ** 2
+        z_imag_squared = z_imag[not_escaped] ** 2
+        
+        new_real = z_real_squared - z_imag_squared + c_real[not_escaped]
+        new_imag = 2.0 * z_real[not_escaped] * z_imag[not_escaped] + c_imag[not_escaped]
+        
+        z_real[not_escaped] = new_real
+        z_imag[not_escaped] = new_imag
+        
+        magnitude_squared = z_real ** 2 + z_imag ** 2
+        escaped_this_iteration = not_escaped & (magnitude_squared > 4.0)
+        
+        if np.any(escaped_this_iteration):
+            escaped_magnitude = np.sqrt(magnitude_squared[escaped_this_iteration])
+            log_zn = np.log(escaped_magnitude)
+            smooth_val = i + 1 - np.log(log_zn) / np.log(2.0)
+            iterations[escaped_this_iteration] = smooth_val
+        
+        not_escaped[escaped_this_iteration] = False
+        
+        if not np.any(not_escaped):
+            break
+    
+    iterations[not_escaped] = max_iterations
+    
+    return iterations
+
+def compute_mandelbrot_vectorised(view: ViewState, config: RenderConfig) -> np.ndarray:
+    """
+    Vectorised Mandelbrot computation using NumPy.
+    
+    This replaces the naive per-pixel algorithm with efficient array operations.
+    Computes normalised iteration counts for smooth colouring.
+    
+    Args:
+        view: Current view state defining the region to compute.
+        config: Rendering configuration.
+        
+    Returns:
+        2D array of normalised iteration counts.
+    """
+    # Create coordinate arrays
+    real_vals = np.linspace(view.x_min, view.x_max, config.width, dtype=np.float64)
+    imag_vals = np.linspace(view.y_max, view.y_min, config.height, dtype=np.float64)
+    
+    # Create meshgrid for all points
+    real_grid, imag_grid = np.meshgrid(real_vals, imag_vals)
+    
+    # Initialise arrays for iteration
+    # c is the constant for each point (doesn't change)
+    c_real = real_grid.copy()
+    c_imag = imag_grid.copy()
+    
+    # z starts at 0
+    z_real = np.zeros_like(c_real)
+    z_imag = np.zeros_like(c_imag)
+    
+    # Track iteration counts and final magnitudes for smooth colouring
+    iterations = np.zeros((config.height, config.width), dtype=np.float64)
+    
+    # Mask of points that haven't escaped yet
+    not_escaped = np.ones((config.height, config.width), dtype=bool)
+    
+    # Main iteration loop
+    for i in range(config.max_iterations):
+        # Only compute for points that haven't escaped
+        # z = z^2 + c using real arithmetic:
+        # new_real = real^2 - imag^2 + c_real
+        # new_imag = 2 * real * imag + c_imag
+        
+        z_real_squared = z_real[not_escaped] ** 2
+        z_imag_squared = z_imag[not_escaped] ** 2
+        
+        # Compute new values
+        new_real = z_real_squared - z_imag_squared + c_real[not_escaped]
+        new_imag = 2.0 * z_real[not_escaped] * z_imag[not_escaped] + c_imag[not_escaped]
+        
+        z_real[not_escaped] = new_real
+        z_imag[not_escaped] = new_imag
+        
+        # Check escape condition: |z|^2 > 4
+        magnitude_squared = z_real ** 2 + z_imag ** 2
+        escaped_this_iteration = not_escaped & (magnitude_squared > 4.0)
+        
+        # Compute smooth iteration count for escaped points
+        # Formula: i + 1 - log2(log2(|z|))
+        if np.any(escaped_this_iteration):
+            escaped_magnitude = np.sqrt(magnitude_squared[escaped_this_iteration])
+            
+            # Smooth colouring formula
+            log_zn = np.log(escaped_magnitude)
+            smooth_val = i + 1 - np.log(log_zn) / np.log(2.0)
+            
+            iterations[escaped_this_iteration] = smooth_val
+        
+        # Update mask
+        not_escaped[escaped_this_iteration] = False
+        
+        # Early exit if all points have escaped
+        if not np.any(not_escaped):
+            break
+    
+    # Points that never escaped get max_iterations
+    iterations[not_escaped] = config.max_iterations
+    
+    return iterations
 
 
-def compute_normalized_iteration_count(iterations: np.ndarray, 
-                                       final_x: np.ndarray, 
-                                       final_y: np.ndarray,
-                                       max_iterations: int) -> np.ndarray:
-   """
-   Compute normalized iteration counts for smooth coloring (vectorized).
-   
-   The normalized iteration count formula: nu = n + 1 - log2(log2(|z|))
-   
-   Args:
-       iterations: Array of discrete iteration counts.
-       final_x: Final x coordinates (real part of z).
-       final_y: Final y coordinates (imaginary part of z).
-       max_iterations: Maximum iterations.
-       
-   Returns:
-       Array of normalized iteration counts.
-   """
-   normalized = iterations.astype(np.float64)
-   
-   # Only compute for points that escaped (not in the set)
-   escaped_mask = iterations < max_iterations
-   
-   if not np.any(escaped_mask):
-       return normalized
-   
-   # Calculate magnitude squared for escaped points
-   magnitude_squared = final_x[escaped_mask]**2 + final_y[escaped_mask]**2
-   
-   # Safety check: magnitude should be > 4 for escaped points
-   valid_mask = magnitude_squared > 1.0
-   
-   if not np.any(valid_mask):
-       return normalized
-   
-   # Calculate magnitude
-   magnitude = np.sqrt(magnitude_squared[valid_mask])
-   
-   # Compute log(log(magnitude)) / log(2) / log(2)
-   log_magnitude = np.log(magnitude)
-   
-   # Filter out any invalid values
-   valid_log_mask = log_magnitude > 0
-   
-   if not np.any(valid_log_mask):
-       return normalized
-   
-   log2_log_magnitude = np.log(log_magnitude[valid_log_mask]) / np.log(2.0)
-   
-   # Apply the normalized iteration count formula
-   # Create a temporary array for the escaped points
-   escaped_normalized = iterations[escaped_mask].astype(np.float64)
-   escaped_normalized_valid = escaped_normalized[valid_mask]
-   escaped_normalized_valid[valid_log_mask] = (
-       escaped_normalized_valid[valid_log_mask] + 1.0 - log2_log_magnitude
-   )
-   
-   # Update the normalized array
-   temp_escaped = escaped_normalized.copy()
-   temp_escaped[valid_mask] = escaped_normalized_valid
-   normalized[escaped_mask] = temp_escaped
-   
-   return np.maximum(0.0, normalized)
+def resize_iterations(iterations: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    """
+    Resize iteration data using bilinear interpolation.
+    
+    Used to upscale low-resolution previews to full resolution for display.
+    """
+    from scipy import ndimage
+    
+    current_height, current_width = iterations.shape
+    
+    if current_height == target_height and current_width == target_width:
+        return iterations
+    
+    # Calculate zoom factors
+    zoom_y = target_height / current_height
+    zoom_x = target_width / current_width
+    
+    # Use scipy's zoom for high-quality interpolation
+    # order=1 is bilinear, order=3 is cubic (slower but smoother)
+    resized = ndimage.zoom(iterations, (zoom_y, zoom_x), order=1)
+    
+    return resized
 
 
-def smooth_iterations_to_rgb(smooth_iterations: np.ndarray, 
-                            max_iterations: int) -> np.ndarray:
-   """
-   Convert smooth iteration counts to RGB values.
-   
-   Args:
-       smooth_iterations: 2D array of normalized iteration counts.
-       max_iterations: Maximum iterations (for identifying set membership).
-       
-   Returns:
-       3D numpy array of shape (height, width, 3) with RGB values (0-255).
-   """
-   height, width = smooth_iterations.shape
-   rgb_array = np.zeros((height, width, 3), dtype=np.uint8)
-   
-   # Mask for points in the set (render as black)
-   in_set_mask = smooth_iterations >= max_iterations - 1
-   
-   # Mask for points outside the set
-   outside_mask = ~in_set_mask
-   
-   if not np.any(outside_mask):
-       return rgb_array  # All black if everything is in the set
-   
-   # Normalize the values for points outside the set
-   outside_values = smooth_iterations[outside_mask]
-   max_val = np.max(outside_values) if np.any(outside_values) else 1.0
-   
-   if max_val > 0:
-       normalized = outside_values / max_val
-   else:
-       normalized = outside_values
-   
-   # Apply smooth coloring using sine functions for RGB
-   # This creates a pleasing gradient
-   r = (255 * (0.5 + 0.5 * np.sin(3.0 * np.pi * normalized))).astype(np.uint8)
-   g = (255 * (0.5 + 0.5 * np.sin(3.0 * np.pi * normalized + 2.094))).astype(np.uint8)
-   b = (255 * (0.5 + 0.5 * np.sin(3.0 * np.pi * normalized + 4.189))).astype(np.uint8)
-   
-   # Assign RGB values
-   rgb_array[outside_mask, 0] = r
-   rgb_array[outside_mask, 1] = g
-   rgb_array[outside_mask, 2] = b
-   
-   # Points in the set remain black (already initialized to 0)
-   
-   return rgb_array
+def iterations_to_rgb(iterations: np.ndarray, max_iterations: int) -> np.ndarray:
+    """
+    Convert iteration counts to RGB image array.
+    
+    Uses sinusoidal colour mapping for smooth gradients.
+    """
+    height, width = iterations.shape
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    in_set = iterations >= max_iterations - 1
+    
+    normalised = np.zeros_like(iterations)
+    if np.any(~in_set):
+        max_iter_external = np.max(iterations[~in_set])
+        if max_iter_external > 0:
+            normalised = iterations / max_iter_external
+    
+    t = normalised * 3.0 * np.pi
+    
+    rgb[:, :, 0] = (127.5 * (1 + np.sin(t))).astype(np.uint8)
+    rgb[:, :, 1] = (127.5 * (1 + np.sin(t + 2.094))).astype(np.uint8)
+    rgb[:, :, 2] = (127.5 * (1 + np.sin(t + 4.189))).astype(np.uint8)
+    
+    rgb[in_set] = [0, 0, 0]
+    
+    return rgb
 
 
-class MandelbrotComputeThread(QThread):
-   """
-   Thread for computing the Mandelbrot set without blocking the UI.
-   """
-   # Signal emitted when computation is complete: (rgb_array, view_state)
-   computation_complete = pyqtSignal(np.ndarray, ViewState)
-   
-   def __init__(self):
-       super().__init__()
-       self.view_state: Optional[ViewState] = None
-       self.should_stop = False
-   
-   def set_view(self, view: ViewState):
-       """Set the view state to compute."""
-       self.view_state = view.copy()
-       self.should_stop = False
-   
-   def stop(self):
-       """Signal the thread to stop computation."""
-       self.should_stop = True
-   
-   def run(self):
-       """Execute the computation in a separate thread."""
-       if self.view_state is None:
-           return
-       
-       # Create complex matrix
-       complex_matrix = create_complex_matrix(self.view_state)
-       
-       # Check if we should stop before heavy computation
-       if self.should_stop:
-           return
-       
-       # Compute using vectorized naive escape time algorithm
-       iterations, final_x, final_y = naive_escape_time_algorithm_vectorized(
-           complex_matrix, 
-           self.view_state.max_iterations
-       )
-       
-       # Check again before continuing
-       if self.should_stop:
-           return
-       
-       # Compute smooth iteration counts
-       smooth_iterations = compute_normalized_iteration_count(
-           iterations,
-           final_x,
-           final_y,
-           self.view_state.max_iterations
-       )
-       
-       # Check before final step
-       if self.should_stop:
-           return
-       
-       # Convert to RGB
-       rgb_array = smooth_iterations_to_rgb(
-           smooth_iterations,
-           self.view_state.max_iterations
-       )
-       
-       # Emit the result if we weren't stopped
-       if not self.should_stop:
-           self.computation_complete.emit(rgb_array, self.view_state)
+class ComputeWorker(QThread):
+    """
+    Optimized worker thread with progressive rendering and caching.
+    """
+    
+    # Signal for preview (low-res) result
+    preview_ready = pyqtSignal(np.ndarray, object)  # (rgb_array, view_state)
+    
+    # Signal for final (full-res) result
+    computation_complete = pyqtSignal(np.ndarray, object)  # (rgb_array, view_state)
+    
+    def __init__(self, config: RenderConfig):
+        super().__init__()
+        self.config = config
+        
+        self.mutex = QMutex()
+        self.condition = QWaitCondition()
+        
+        self.pending_view: Optional[ViewState] = None
+        self.should_stop = False
+        self.has_work = False
+        
+        # Initialize cache
+        self.cache = ViewCache(max_size=config.cache_size)
+        
+        # Track current computation to allow cancellation
+        self.current_view: Optional[ViewState] = None
+    
+    def request_computation(self, view: ViewState) -> None:
+        """Request computation for a new view."""
+        self.mutex.lock()
+        self.pending_view = view.copy()
+        self.has_work = True
+        self.condition.wakeOne()
+        self.mutex.unlock()
+    
+    def stop(self) -> None:
+        """Signal the worker to stop."""
+        self.mutex.lock()
+        self.should_stop = True
+        self.has_work = True
+        self.condition.wakeOne()
+        self.mutex.unlock()
+        self.wait()
+    
+    def _check_cancelled(self) -> bool:
+        """Check if current computation has been superseded."""
+        self.mutex.lock()
+        cancelled = self.has_work  # New work means current is cancelled
+        self.mutex.unlock()
+        return cancelled
+    
+    def run(self) -> None:
+        """Main worker loop with progressive rendering and caching."""
+        while True:
+            self.mutex.lock()
+            while not self.has_work:
+                self.condition.wait(self.mutex)
+            
+            if self.should_stop:
+                self.mutex.unlock()
+                break
+            
+            view = self.pending_view
+            self.pending_view = None
+            self.has_work = False
+            self.current_view = view
+            self.mutex.unlock()
+            
+            if view is None:
+                continue
+            
+            # Check cache first
+            max_iter = self.config.get_iterations_for_zoom(view.zoom_level)
+            cache_key = view.get_cache_key(self.config.width, self.config.height, max_iter)
+            
+            cached_iterations = self.cache.get(cache_key)
+            if cached_iterations is not None:
+                # Cache hit! Convert and emit immediately
+                rgb_array = iterations_to_rgb(cached_iterations, max_iter)
+                
+                if not self._check_cancelled():
+                    self.computation_complete.emit(rgb_array, view)
+                continue
+            
+            # Progressive rendering: compute low-res preview first
+            if self.config.enable_progressive:
+                preview_width = self.config.width // self.config.preview_scale
+                preview_height = self.config.height // self.config.preview_scale
+                
+                # Compute preview
+                preview_iterations = compute_mandelbrot_optimized(
+                    view, self.config, preview_width, preview_height
+                )
+                
+                # Check if cancelled
+                if self._check_cancelled():
+                    continue
+                
+                # Upscale preview to full resolution for display
+                preview_upscaled = resize_iterations(
+                    preview_iterations, self.config.width, self.config.height
+                )
+                
+                preview_rgb = iterations_to_rgb(preview_upscaled, max_iter)
+                
+                # Emit preview
+                if not self._check_cancelled():
+                    self.preview_ready.emit(preview_rgb, view)
+            
+            # Compute full resolution
+            full_iterations = compute_mandelbrot_optimized(view, self.config)
+            
+            # Check if cancelled after expensive computation
+            if self._check_cancelled():
+                continue
+            
+            # Store in cache
+            self.cache.put(cache_key, full_iterations)
+            
+            # Convert to RGB
+            rgb_array = iterations_to_rgb(full_iterations, max_iter)
+            
+            # Final check before emitting
+            if not self._check_cancelled():
+                self.computation_complete.emit(rgb_array, view)
 
 
-class MandelbrotViewer(QMainWindow):
-   """
-   Interactive Mandelbrot set viewer with scroll-based zooming.
-   """
-   
-   # Precision limit for float64: approximately 10^-15 relative precision
-   # With a standard view width of ~3.5, the practical zoom limit is around 10^14
-   MIN_VIEW_WIDTH = 1e-13  # Absolute minimum width in complex plane units
-   
-   # Zoom factor per scroll step
-   ZOOM_FACTOR = 1.2
-   
-   def __init__(self):
-       super().__init__()
-       self.setWindowTitle("Interactive Mandelbrot Set Viewer")
-       
-       # Initialize view state to show the classic full Mandelbrot view
-       self.current_view = ViewState(
-           center_x=-0.5,
-           center_y=0.0,
-           width=3.5,
-           height=2.5,
-           pixel_width=800,
-           pixel_height=600,
-           max_iterations=256
-       )
-       
-       # Current displayed image
-       self.current_image: Optional[np.ndarray] = None
-       self.current_pixmap: Optional[QPixmap] = None
-       
-       # Computation thread
-       self.compute_thread = MandelbrotComputeThread()
-       self.compute_thread.computation_complete.connect(self.on_computation_complete)
-       
-       # Track if computation is in progress
-       self.computing = False
-       
-       # Track if a new computation is needed
-       self.computation_pending = False
-       self.pending_view: Optional[ViewState] = None
-       
-       # Setup UI
-       self.setup_ui()
-       
-       # Start initial computation
-       self.request_computation(self.current_view)
-   
-   def setup_ui(self):
-       """Initialize the user interface."""
-       # Central widget
-       central_widget = QWidget()
-       self.setCentralWidget(central_widget)
-       
-       # Layout
-       layout = QVBoxLayout()
-       central_widget.setLayout(layout)
-       
-       # Image label
-       self.image_label = QLabel()
-       self.image_label.setFixedSize(
-           self.current_view.pixel_width,
-           self.current_view.pixel_height
-       )
-       self.image_label.setStyleSheet("background-color: black;")
-       self.image_label.setMouseTracking(True)
-       
-       # Enable mouse tracking for the entire widget
-       self.setMouseTracking(True)
-       central_widget.setMouseTracking(True)
-       
-       layout.addWidget(self.image_label)
-       
-       # Status label
-       self.status_label = QLabel("Initializing...")
-       layout.addWidget(self.status_label)
-       
-       # Adjust window size
-       self.adjustSize()
-       self.setFixedSize(self.size())
-   
-   def request_computation(self, view: ViewState):
-       """
-       Request a computation for the given view state.
-       If a computation is in progress, queue this request.
-       """
-       if self.computing:
-           # Queue this computation
-           self.computation_pending = True
-           self.pending_view = view.copy()
-           self.status_label.setText("Computing... (new request queued)")
-       else:
-           # Start computation immediately
-           self.computing = True
-           self.computation_pending = False
-           self.pending_view = None
-           self.compute_thread.set_view(view)
-           self.compute_thread.start()
-           self.status_label.setText("Computing...")
-   
-   def on_computation_complete(self, rgb_array: np.ndarray, view: ViewState):
-       """
-       Handle completion of a computation thread.
-       """
-       self.computing = False
-       
-       # Update current image and view
-       self.current_image = rgb_array
-       self.current_view = view
-       
-       # Convert to QPixmap and display
-       height, width, _ = rgb_array.shape
-       bytes_per_line = 3 * width
-       
-       q_image = QImage(
-           rgb_array.data,
-           width,
-           height,
-           bytes_per_line,
-           QImage.Format_RGB888
-       )
-       
-       self.current_pixmap = QPixmap.fromImage(q_image)
-       self.image_label.setPixmap(self.current_pixmap)
-       
-       # Update status
-       self.update_status_label()
-       
-       # If there's a pending computation, start it
-       if self.computation_pending and self.pending_view is not None:
-           self.request_computation(self.pending_view)
-   
-   def update_status_label(self):
-       """Update the status label with current view information."""
-       # Calculate current zoom level relative to initial view
-       initial_width = 3.5
-       zoom_level = initial_width / self.current_view.width
-       
-       # Check if we're near the precision limit
-       precision_percent = (self.current_view.width / self.MIN_VIEW_WIDTH) * 100
-       
-       if precision_percent < 200:  # Within 2x of the limit
-           status_text = (
-               f"Center: ({self.current_view.center_x:.10e}, {self.current_view.center_y:.10e}) | "
-               f"Zoom: {zoom_level:.2e}x | "
-               f"⚠ Approaching precision limit ({precision_percent:.0f}%)"
-           )
-       else:
-           status_text = (
-               f"Center: ({self.current_view.center_x:.6f}, {self.current_view.center_y:.6f}) | "
-               f"Zoom: {zoom_level:.2e}x"
-           )
-       
-       self.status_label.setText(status_text)
-   
-   def wheelEvent(self, event):
-       """
-       Handle mouse wheel events for zooming.
-       Zoom is centered on the current mouse position.
-       """
-       # Get mouse position relative to the image label
-       mouse_pos = self.image_label.mapFromGlobal(event.globalPos())
-       
-       # Check if mouse is within the image bounds
-       if not (0 <= mouse_pos.x() < self.current_view.pixel_width and
-               0 <= mouse_pos.y() < self.current_view.pixel_height):
-           return
-       
-       # Determine zoom direction
-       angle_delta = event.angleDelta().y()
-       
-       if angle_delta > 0:
-           # Zoom in
-           zoom_factor = 1.0 / self.ZOOM_FACTOR
-       else:
-           # Zoom out
-           zoom_factor = self.ZOOM_FACTOR
-       
-       # Calculate new view dimensions
-       new_width = self.current_view.width * zoom_factor
-       new_height = self.current_view.height * zoom_factor
-       
-       # Check precision limit (only for zoom in)
-       if new_width < self.MIN_VIEW_WIDTH:
-           self.status_label.setText(
-               "⚠ Zoom limit reached - float64 precision exhausted"
-           )
-           return
-       
-       # Convert mouse pixel coordinates to complex plane coordinates
-       pixel_x = mouse_pos.x()
-       pixel_y = mouse_pos.y()
-       
-       # Current position of mouse in complex plane
-       mouse_complex_x = (self.current_view.x_min + 
-                         (pixel_x / self.current_view.pixel_width) * self.current_view.width)
-       mouse_complex_y = (self.current_view.y_max - 
-                         (pixel_y / self.current_view.pixel_height) * self.current_view.height)
-       
-       # Calculate offset from current center to mouse position
-       offset_x = mouse_complex_x - self.current_view.center_x
-       offset_y = mouse_complex_y - self.current_view.center_y
-       
-       # New center: zoom toward the mouse position
-       # When zooming in (zoom_factor < 1), we move the center toward the mouse
-       # When zooming out (zoom_factor > 1), we move the center away from the mouse
-       new_center_x = self.current_view.center_x + offset_x * (1 - zoom_factor)
-       new_center_y = self.current_view.center_y + offset_y * (1 - zoom_factor)
-       
-       # Create new view state
-       new_view = ViewState(
-           center_x=new_center_x,
-           center_y=new_center_y,
-           width=new_width,
-           height=new_height,
-           pixel_width=self.current_view.pixel_width,
-           pixel_height=self.current_view.pixel_height,
-           max_iterations=self.current_view.max_iterations
-       )
-       
-       # Request computation for new view
-       self.request_computation(new_view)
-   
-   def closeEvent(self, event):
-       """Handle window close event."""
-       # Stop any ongoing computation
-       if self.computing:
-           self.compute_thread.stop()
-           self.compute_thread.wait()
-       
-       event.accept()
+class MandelbrotWidget(QLabel):
+    """
+    Optimized widget with progressive rendering support.
+    """
+    
+    def __init__(self, config: RenderConfig, parent=None):
+        super().__init__(parent)
+        
+        self.config = config
+        self.view = ViewState()
+        self.current_mouse_pos: Optional[QPointF] = None
+        
+        self.zoom_factor = 1.5
+        
+        initial_pixel_spacing = self.view.initial_width / self.config.width
+        self.max_zoom = initial_pixel_spacing / self.config.min_pixel_spacing
+        
+        self.setFixedSize(config.width, config.height)
+        self.setMouseTracking(True)
+        
+        # Create and start the optimized compute worker
+        self.worker = ComputeWorker(config)
+        self.worker.preview_ready.connect(self._on_preview_ready)
+        self.worker.computation_complete.connect(self._on_computation_complete)
+        self.worker.start()
+        
+        self._show_loading_state()
+        
+        self.worker.request_computation(self.view)
+    
+    def _show_loading_state(self) -> None:
+        """Display a placeholder while computing."""
+        grey = np.full((self.config.height, self.config.width, 3), 128, dtype=np.uint8)
+        self._display_rgb_array(grey)
+    
+    def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
+        """Convert numpy RGB array to QPixmap and display."""
+        height, width, channels = rgb_array.shape
+        bytes_per_line = channels * width
+        
+        rgb_contiguous = np.ascontiguousarray(rgb_array)
+        
+        qimage = QImage(
+            rgb_contiguous.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format.Format_RGB888
+        )
+        
+        self._current_image_data = rgb_contiguous
+        
+        self.setPixmap(QPixmap.fromImage(qimage))
+    
+    def _on_preview_ready(self, rgb_array: np.ndarray, view: ViewState) -> None:
+        """Handle low-res preview from worker thread."""
+        # Display preview immediately for responsive feedback
+        self._display_rgb_array(rgb_array)
+    
+    def _on_computation_complete(self, rgb_array: np.ndarray, view: ViewState) -> None:
+        """Handle completed full-resolution computation."""
+        self._display_rgb_array(rgb_array)
+    
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Track mouse position for zoom centring."""
+        self.current_mouse_pos = event.position()
+        super().mouseMoveEvent(event)
+    
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Handle scroll wheel for zooming."""
+        delta = event.angleDelta().y()
+        
+        if delta == 0:
+            return
+        
+        if delta > 0:
+            new_zoom = self.view.zoom_level * self.zoom_factor
+        else:
+            new_zoom = self.view.zoom_level / self.zoom_factor
+        
+        if new_zoom < 1.0:
+            new_zoom = 1.0
+        elif new_zoom > self.max_zoom:
+            new_zoom = self.max_zoom
+            if self.view.zoom_level >= self.max_zoom:
+                return
+        
+        pos = event.position()
+        zoom_x = pos.x()
+        zoom_y = pos.y()
+        
+        complex_x, complex_y = self.view.pixel_to_complex(
+            int(zoom_x), int(zoom_y),
+            self.config.width, self.config.height
+        )
+        
+        rel_x = zoom_x / self.config.width
+        rel_y = zoom_y / self.config.height
+        
+        self.view.zoom_level = new_zoom
+        
+        new_width = self.view.current_width
+        new_height = self.view.current_height
+        
+        self.view.centre_real = complex_x - (rel_x - 0.5) * new_width
+        self.view.centre_imag = complex_y + (rel_y - 0.5) * new_height
+        
+        self.worker.request_computation(self.view)
+    
+    def cleanup(self) -> None:
+        """Stop the worker thread."""
+        self.worker.stop()
+
+
+class MandelbrotWindow(QMainWindow):
+    """Main application window."""
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.setWindowTitle("Mandelbrot Set Viewer")
+        
+        # Create render configuration
+        self.config = RenderConfig(
+            width=800,
+            height=600,
+            max_iterations=256
+        )
+        
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Create layout
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create Mandelbrot display widget
+        self.mandelbrot_widget = MandelbrotWidget(self.config)
+        layout.addWidget(self.mandelbrot_widget)
+        
+        # Create status label for zoom information
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("padding: 5px; background-color: #333; color: white;")
+        self._update_status()
+        layout.addWidget(self.status_label)
+        
+        # Connect to track zoom changes
+        self.mandelbrot_widget.worker.computation_complete.connect(self._on_view_updated)
+        
+        # Size window to fit contents
+        self.setFixedSize(self.sizeHint())
+    
+    def _update_status(self) -> None:
+        """Update the status label with current view information."""
+        view = self.mandelbrot_widget.view
+        
+        # Check if at precision limit
+        at_limit = view.zoom_level >= self.mandelbrot_widget.max_zoom * 0.99
+        limit_warning = " [PRECISION LIMIT]" if at_limit else ""
+        
+        self.status_label.setText(
+            f"Centre: ({view.centre_real:.10g}, {view.centre_imag:.10g})  |  "
+            f"Zoom: {view.zoom_level:.2e}x{limit_warning}"
+        )
+    
+    def _on_view_updated(self, rgb_array: np.ndarray, view: ViewState) -> None:
+        """Called when a new view has been computed."""
+        self._update_status()
+    
+    def closeEvent(self, event) -> None:
+        """Clean up worker thread on close."""
+        self.mandelbrot_widget.cleanup()
+        super().closeEvent(event)
 
 
 def main():
-   """Main entry point for the interactive Mandelbrot viewer."""
-   app = QApplication(sys.argv)
-   
-   viewer = MandelbrotViewer()
-   viewer.show()
-   
-   sys.exit(app.exec_())
+    """Application entry point."""
+    import sys
+    
+    app = QApplication(sys.argv)
+    
+    # Set application style
+    app.setStyle('Fusion')
+    
+    window = MandelbrotWindow()
+    window.show()
+    
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-   main()
+    main()
