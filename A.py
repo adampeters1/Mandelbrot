@@ -217,86 +217,119 @@ def upscale_nearest(small: np.ndarray, factor: int) -> np.ndarray:
    return result
 
 
+@jit(nopython=True, parallel=True, cache=True, fastmath=True)
+def colour_selector_numba(iterations: np.ndarray, max_iterations: int,
+                          hue_shift: float, saturation: float,
+                          lightness: float, max_external: float) -> np.ndarray:
+    """
+    Numba JIT-compiled HSL colour conversion with parallel processing.
+    
+    Args:
+        iterations: 2D array of iteration counts.
+        max_iterations: Maximum iteration value.
+        hue_shift: Hue rotation in range [0, 1].
+        saturation: Saturation multiplier in range [0, 1].
+        lightness: Lightness adjustment in range [0, 1].
+        max_external: Pre-computed maximum iteration value for normalisation.
+        
+    Returns:
+        3D RGB array (height, width, 3).
+    """
+    height, width = iterations.shape
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    # Precompute constants
+    threshold = max_iterations - 1.0
+    inv_max_external = 1.0 / max_external if max_external > 0 else 1.0
+    
+    for y in prange(height):
+        for x in range(width):
+            val = iterations[y, x]
+            
+            # Points in the set are black
+            if val >= threshold:
+                rgb[y, x, 0] = 0
+                rgb[y, x, 1] = 0
+                rgb[y, x, 2] = 0
+                continue
+            
+            # Normalise and apply hue shift
+            normalised = val * inv_max_external
+            hue = (normalised + hue_shift) % 1.0
+            
+            # HSL to RGB conversion (inline)
+            c = (1.0 - abs(2.0 * lightness - 1.0)) * saturation
+            h_sector = hue * 6.0
+            x_val = c * (1.0 - abs(h_sector % 2.0 - 1.0))
+            m = lightness - c * 0.5
+            
+            # Determine RGB based on hue sector
+            sector = int(h_sector) % 6
+            
+            if sector == 0:
+                r, g, b = c, x_val, 0.0
+            elif sector == 1:
+                r, g, b = x_val, c, 0.0
+            elif sector == 2:
+                r, g, b = 0.0, c, x_val
+            elif sector == 3:
+                r, g, b = 0.0, x_val, c
+            elif sector == 4:
+                r, g, b = x_val, 0.0, c
+            else:
+                r, g, b = c, 0.0, x_val
+            
+            # Add m and convert to 0-255, clamping values
+            r_val = (r + m) * 255.0
+            g_val = (g + m) * 255.0
+            b_val = (b + m) * 255.0
+            
+            # Clamp to valid range
+            if r_val < 0.0:
+                r_val = 0.0
+            elif r_val > 255.0:
+                r_val = 255.0
+            if g_val < 0.0:
+                g_val = 0.0
+            elif g_val > 255.0:
+                g_val = 255.0
+            if b_val < 0.0:
+                b_val = 0.0
+            elif b_val > 255.0:
+                b_val = 255.0
+            
+            rgb[y, x, 0] = np.uint8(r_val)
+            rgb[y, x, 1] = np.uint8(g_val)
+            rgb[y, x, 2] = np.uint8(b_val)
+    
+    return rgb
+
+
 def colour_selector(iterations: np.ndarray, max_iterations: int,
-                   hue_shift: float = 0.0, saturation: float = 1.0,
-                   lightness: float = 0.5) -> np.ndarray:
-   """
-   Convert iteration counts to RGB with adjustable HSL parameters.
-   
-   Args:
-       iterations: 2D array of iteration counts.
-       max_iterations: Maximum iteration value.
-       hue_shift: Hue rotation in range [0, 1].
-       saturation: Saturation multiplier in range [0, 1].
-       lightness: Lightness adjustment in range [0, 1].
-       
-   Returns:
-       3D RGB array (height, width, 3).
-   """
-   height, width = iterations.shape
-   rgb = np.zeros((height, width, 3), dtype=np.uint8)
-   
-   # Mask for points in the set
-   in_set = iterations >= max_iterations - 1
-   
-   # Normalise iteration counts for points outside the set
-   normalised = np.zeros_like(iterations)
-   max_external = np.max(iterations[~in_set]) if np.any(~in_set) else 1.0
-   if max_external > 0:
-       normalised = iterations / max_external
-   
-   # Calculate hue with shift (wrapping around 0-1)
-   hue = (normalised + hue_shift) % 1.0
-   
-   # Create saturation and lightness arrays
-   sat = np.full_like(hue, saturation)
-   lit = np.full_like(hue, lightness)
-   
-   # HSL to RGB conversion
-   c = (1 - np.abs(2 * lit - 1)) * sat
-   x = c * (1 - np.abs((hue * 6) % 2 - 1))
-   m = lit - c / 2
-   
-   # Determine RGB based on hue sector
-   hue_sector = (hue * 6).astype(int) % 6
-   
-   r = np.zeros_like(hue)
-   g = np.zeros_like(hue)
-   b = np.zeros_like(hue)
-   
-   # Sector 0: R=C, G=X, B=0
-   mask = hue_sector == 0
-   r[mask], g[mask], b[mask] = c[mask], x[mask], 0
-   
-   # Sector 1: R=X, G=C, B=0
-   mask = hue_sector == 1
-   r[mask], g[mask], b[mask] = x[mask], c[mask], 0
-   
-   # Sector 2: R=0, G=C, B=X
-   mask = hue_sector == 2
-   r[mask], g[mask], b[mask] = 0, c[mask], x[mask]
-   
-   # Sector 3: R=0, G=X, B=C
-   mask = hue_sector == 3
-   r[mask], g[mask], b[mask] = 0, x[mask], c[mask]
-   
-   # Sector 4: R=X, G=0, B=C
-   mask = hue_sector == 4
-   r[mask], g[mask], b[mask] = x[mask], 0, c[mask]
-   
-   # Sector 5: R=C, G=0, B=X
-   mask = hue_sector == 5
-   r[mask], g[mask], b[mask] = c[mask], 0, x[mask]
-   
-   # Add m and convert to 0-255
-   rgb[:, :, 0] = np.clip((r + m) * 255, 0, 255).astype(np.uint8)
-   rgb[:, :, 1] = np.clip((g + m) * 255, 0, 255).astype(np.uint8)
-   rgb[:, :, 2] = np.clip((b + m) * 255, 0, 255).astype(np.uint8)
-   
-   # Points in the set are black
-   rgb[in_set] = [0, 0, 0]
-   
-   return rgb
+                    hue_shift: float = 0.0, saturation: float = 1.0,
+                    lightness: float = 0.5) -> np.ndarray:
+    """
+    Wrapper function that calls the Numba-optimised colour conversion.
+    
+    Maintains the same interface as the original function.
+    """
+    # Mask for points in the set
+    in_set = iterations >= max_iterations - 1
+    
+    # Calculate max_external for normalisation
+    if np.any(~in_set):
+        max_external = np.max(iterations[~in_set])
+    else:
+        max_external = 1.0
+    
+    if max_external <= 0:
+        max_external = 1.0
+    
+    return colour_selector_numba(
+        iterations, max_iterations,
+        hue_shift, saturation, lightness,
+        max_external
+    )
 
 
 class TileCache:
@@ -403,6 +436,7 @@ class ComputeWorker(QThread):
        _ = compute_mandelbrot_subsampled(-2.0, 1.0, -1.0, 1.0, 16, 16, 32, 4)
        test_iter = np.zeros((4, 4), dtype=np.float64)
        _ = upscale_nearest(test_iter, 2)
+       _ = colour_selector_numba(test_iter, 32, 0.0, 1.0, 0.5, 1.0)
    
    def set_colour_params(self, hue: float, saturation: float, lightness: float) -> None:
        """Update colour parameters."""

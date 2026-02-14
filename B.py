@@ -6,6 +6,7 @@ centred on mouse position, and precision limit detection.
 """
 
 import sys
+import time
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
@@ -17,7 +18,7 @@ from PyQt6.QtWidgets import (
    QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
    QWidget, QFileDialog, QMessageBox, QSlider, QGroupBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QWheelEvent
 
 from PIL import Image, ImageDraw, ImageFont
@@ -366,360 +367,469 @@ def get_adaptive_iterations(zoom_level: float, config: RenderConfig) -> int:
    return config.base_iterations + additional
 
 
+class ComputationDebouncer:
+    """Debounces rapid computation requests to prevent wasted work."""
+    
+    def __init__(self, delay_ms: int = 50):
+        self.delay_ms = delay_ms
+        self.last_request_time: float = 0
+        self.pending_request: Optional[ViewState] = None
+        self.timer: Optional[QTimer] = None
+    
+    def should_compute(self, view: ViewState, current_time: float) -> bool:
+        """Determine if enough time has passed to compute."""
+        time_since_last = current_time - self.last_request_time
+        return time_since_last >= (self.delay_ms / 1000.0)
+    
+    def record_computation(self, view: ViewState) -> None:
+        """Record that a computation was started."""
+        self.last_request_time = time.time()
+        self.pending_request = None
+
+
 class ComputeWorker(QThread):
-   """Worker thread with progressive rendering and caching."""
-   
-   # Signal for each progressive pass (rgb_array, view_state, is_final, iterations, max_iter)
-   computation_progress = pyqtSignal(np.ndarray, object, bool, object, int)
-   
-   def __init__(self, config: RenderConfig):
-       super().__init__()
-       self.config = config
-       
-       # Thread synchronisation
-       self.mutex = QMutex()
-       self.condition = QWaitCondition()
-       
-       # Request state
-       self.pending_view: Optional[ViewState] = None
-       self.current_request_id: int = 0
-       self.should_stop = False
-       self.has_work = False
-       
-       # Tile cache
-       self.tile_cache = TileCache(config.max_cached_tiles)
-       
-       # HSL colour parameters
-       self.hue_shift: float = 0.0
-       self.saturation: float = 1.0
-       self.lightness: float = 0.5
-       
-       # Warm up Numba JIT compilation
-       self._warmup_jit()
-   
-   def _warmup_jit(self) -> None:
-       """Pre-compile Numba functions to avoid delay on first zoom."""
-       _ = compute_mandelbrot_numba(-2.0, 1.0, -1.0, 1.0, 16, 16, 32)
-       _ = compute_mandelbrot_subsampled(-2.0, 1.0, -1.0, 1.0, 16, 16, 32, 4)
-       test_iter = np.zeros((4, 4), dtype=np.float64)
-       _ = upscale_nearest(test_iter, 2)
-   
-   def set_colour_params(self, hue: float, saturation: float, lightness: float) -> None:
-       """Update colour parameters."""
-       self.mutex.lock()
-       self.hue_shift = hue
-       self.saturation = saturation
-       self.lightness = lightness
-       self.mutex.unlock()
-   
-   def request_computation(self, view: ViewState) -> None:
-       """Request computation for a new view."""
-       self.mutex.lock()
-       self.pending_view = view.copy()
-       self.current_request_id += 1
-       self.has_work = True
-       self.condition.wakeOne()
-       self.mutex.unlock()
-   
-   def stop(self) -> None:
-       """Signal worker to stop."""
-       self.mutex.lock()
-       self.should_stop = True
-       self.has_work = True
-       self.condition.wakeOne()
-       self.mutex.unlock()
-       self.wait()
-   
-   def _is_request_stale(self, request_id: int) -> bool:
-       """Check if a newer request has superseded this one."""
-       self.mutex.lock()
-       stale = request_id != self.current_request_id
-       self.mutex.unlock()
-       return stale
-   
-   def run(self) -> None:
-       """Main worker loop with progressive rendering."""
-       while True:
-           self.mutex.lock()
-           while not self.has_work:
-               self.condition.wait(self.mutex)
-           
-           if self.should_stop:
-               self.mutex.unlock()
-               break
-           
-           view = self.pending_view
-           request_id = self.current_request_id
-           self.pending_view = None
-           self.has_work = False
-           self.mutex.unlock()
-           
-           if view is None:
-               continue
-           
-           # Get adaptive iteration count
-           max_iter = get_adaptive_iterations(view.zoom_level, self.config)
-           
-           # Check cache for full resolution result
-           cached = self.tile_cache.get(
-               view.x_min, view.x_max, view.y_min, view.y_max,
-               self.config.width, self.config.height, max_iter
-           )
-           
-           if cached is not None:
-               self.mutex.lock()
-               hue = self.hue_shift
-               sat = self.saturation
-               lit = self.lightness
-               self.mutex.unlock()
-               
-               rgb = colour_selector(cached, max_iter, hue, sat, lit)
-               if not self._is_request_stale(request_id):
-                   self.computation_progress.emit(rgb, view, True, cached, max_iter)
-               continue
-           
-           # Progressive rendering passes
-           for subsample in self.config.progressive_passes:
-               if self._is_request_stale(request_id):
-                   break
-               
-               is_final = (subsample == 1)
-               
-               if subsample > 1:
-                   iterations = compute_mandelbrot_subsampled(
-                       view.x_min, view.x_max,
-                       view.y_min, view.y_max,
-                       self.config.width, self.config.height,
-                       max_iter, subsample
-                   )
-                   iterations_full = upscale_nearest(iterations, subsample)
-               else:
-                   iterations_full = compute_mandelbrot_numba(
-                       view.x_min, view.x_max,
-                       view.y_min, view.y_max,
-                       self.config.width, self.config.height,
-                       max_iter
-                   )
-                   
-                   self.tile_cache.put(
-                       view.x_min, view.x_max, view.y_min, view.y_max,
-                       self.config.width, self.config.height, max_iter,
-                       iterations_full
-                   )
-               
-               if self._is_request_stale(request_id):
-                   break
-               
-               # Convert to RGB using colour_selector
-               self.mutex.lock()
-               hue = self.hue_shift
-               sat = self.saturation
-               lit = self.lightness
-               self.mutex.unlock()
-               
-               rgb = colour_selector(iterations_full, max_iter, hue, sat, lit)
-               
-               if not self._is_request_stale(request_id):
-                   self.computation_progress.emit(rgb, view, is_final, iterations_full, max_iter)
+    """Worker thread with progressive rendering, caching, and color separation."""
+    
+    # Separate signals for computation and recoloring
+    computation_progress = pyqtSignal(np.ndarray, object, bool, object, int)
+    recolor_complete = pyqtSignal(np.ndarray)
+    
+    def __init__(self, config: RenderConfig):
+        super().__init__()
+        self.config = config
+        
+        # Thread synchronisation
+        self.mutex = QMutex()
+        self.condition = QWaitCondition()
+        
+        # Request state
+        self.pending_view: Optional[ViewState] = None
+        self.pending_recolor: bool = False
+        self.current_request_id: int = 0
+        self.should_stop = False
+        self.has_work = False
+        
+        # Enhanced tile cache - now stores iterations permanently
+        self.tile_cache = TileCache(config.max_cached_tiles)
+        
+        # Current iteration data (for instant recoloring)
+        self.current_iterations: Optional[np.ndarray] = None
+        self.current_max_iter: int = config.max_iterations
+        self.current_view: Optional[ViewState] = None
+        
+        # HSL colour parameters
+        self.hue_shift: float = 0.0
+        self.saturation: float = 1.0
+        self.lightness: float = 0.5
+        
+        # Debouncer for rapid zoom/pan operations
+        self.debouncer = ComputationDebouncer(delay_ms=50)
+        
+        # Warm up Numba JIT compilation
+        self._warmup_jit()
+    
+    def _warmup_jit(self) -> None:
+        """Pre-compile Numba functions to avoid delay on first zoom."""
+        _ = compute_mandelbrot_numba(-2.0, 1.0, -1.0, 1.0, 16, 16, 32)
+        _ = compute_mandelbrot_subsampled(-2.0, 1.0, -1.0, 1.0, 16, 16, 32, 4)
+        test_iter = np.zeros((4, 4), dtype=np.float64)
+        _ = upscale_nearest(test_iter, 2)
+    
+    def set_colour_params(self, hue: float, saturation: float, lightness: float) -> None:
+        """Update colour parameters and trigger recolor only."""
+        self.mutex.lock()
+        self.hue_shift = hue
+        self.saturation = saturation
+        self.lightness = lightness
+        self.pending_recolor = True
+        self.has_work = True
+        self.condition.wakeOne()
+        self.mutex.unlock()
+    
+    def request_computation(self, view: ViewState) -> None:
+        """Request computation for a new view."""
+        self.mutex.lock()
+        self.pending_view = view.copy()
+        self.current_request_id += 1
+        self.has_work = True
+        self.condition.wakeOne()
+        self.mutex.unlock()
+    
+    def stop(self) -> None:
+        """Signal worker to stop."""
+        self.mutex.lock()
+        self.should_stop = True
+        self.has_work = True
+        self.condition.wakeOne()
+        self.mutex.unlock()
+        self.wait()
+    
+    def _is_request_stale(self, request_id: int) -> bool:
+        """Check if a newer request has superseded this one."""
+        self.mutex.lock()
+        stale = request_id != self.current_request_id
+        self.mutex.unlock()
+        return stale
+    
+    def _handle_recolor_request(self) -> None:
+        """Handle a recolor-only request (no computation needed)."""
+        self.mutex.lock()
+        
+        if self.current_iterations is None:
+            self.pending_recolor = False
+            self.mutex.unlock()
+            return
+        
+        iterations = self.current_iterations.copy()
+        max_iter = self.current_max_iter
+        view = self.current_view.copy() if self.current_view else None
+        hue = self.hue_shift
+        sat = self.saturation
+        lit = self.lightness
+        self.pending_recolor = False
+        
+        self.mutex.unlock()
+        
+        # Recolor without locking
+        rgb = colour_selector(iterations, max_iter, hue, sat, lit)
+        
+        # Emit with full data so widget can update
+        if view:
+            self.computation_progress.emit(rgb, view, True, iterations, max_iter)
+    
+    def run(self) -> None:
+        """Main worker loop with progressive rendering and smart caching."""
+        while True:
+            self.mutex.lock()
+            while not self.has_work:
+                self.condition.wait(self.mutex)
+            
+            if self.should_stop:
+                self.mutex.unlock()
+                break
+            
+            # Check if this is just a recolor request
+            if self.pending_recolor and self.pending_view is None:
+                self.has_work = False
+                self.mutex.unlock()
+                self._handle_recolor_request()
+                continue
+            
+            # Handle computation request
+            view = self.pending_view
+            request_id = self.current_request_id
+            self.pending_view = None
+            self.has_work = False
+            self.mutex.unlock()
+            
+            if view is None:
+                continue
+            
+            # Debouncing - skip computation if requests are coming too fast
+            current_time = time.time()
+            if not self.debouncer.should_compute(view, current_time):
+                # Store as pending and wait
+                self.mutex.lock()
+                if self.pending_view is None:  # Don't override newer request
+                    self.pending_view = view
+                    self.has_work = True
+                self.mutex.unlock()
+                time.sleep(0.03)  # Small delay before retry
+                continue
+            
+            self.debouncer.record_computation(view)
+            
+            # Get adaptive iteration count
+            max_iter = get_adaptive_iterations(view.zoom_level, self.config)
+            
+            # Check cache for full resolution result
+            cached = self.tile_cache.get(
+                view.x_min, view.x_max, view.y_min, view.y_max,
+                self.config.width, self.config.height, max_iter
+            )
+            
+            if cached is not None:
+                # Cache hit - store and colorize
+                self.mutex.lock()
+                self.current_iterations = cached.copy()
+                self.current_max_iter = max_iter
+                self.current_view = view.copy()
+                hue = self.hue_shift
+                sat = self.saturation
+                lit = self.lightness
+                self.mutex.unlock()
+                
+                rgb = colour_selector(cached, max_iter, hue, sat, lit)
+                if not self._is_request_stale(request_id):
+                    self.computation_progress.emit(rgb, view, True, cached, max_iter)
+                continue
+            
+            # Progressive rendering passes
+            for subsample in self.config.progressive_passes:
+                if self._is_request_stale(request_id):
+                    break
+                
+                is_final = (subsample == 1)
+                
+                if subsample > 1:
+                    iterations = compute_mandelbrot_subsampled(
+                        view.x_min, view.x_max,
+                        view.y_min, view.y_max,
+                        self.config.width, self.config.height,
+                        max_iter, subsample
+                    )
+                    iterations_full = upscale_nearest(iterations, subsample)
+                else:
+                    iterations_full = compute_mandelbrot_numba(
+                        view.x_min, view.x_max,
+                        view.y_min, view.y_max,
+                        self.config.width, self.config.height,
+                        max_iter
+                    )
+                    
+                    # Cache the final iteration data
+                    self.tile_cache.put(
+                        view.x_min, view.x_max, view.y_min, view.y_max,
+                        self.config.width, self.config.height, max_iter,
+                        iterations_full
+                    )
+                    
+                    # Store current iterations for instant recoloring
+                    self.mutex.lock()
+                    self.current_iterations = iterations_full.copy()
+                    self.current_max_iter = max_iter
+                    self.current_view = view.copy()
+                    self.mutex.unlock()
+                
+                if self._is_request_stale(request_id):
+                    break
+                
+                # Colorize with current settings
+                self.mutex.lock()
+                hue = self.hue_shift
+                sat = self.saturation
+                lit = self.lightness
+                self.mutex.unlock()
+                
+                rgb = colour_selector(iterations_full, max_iter, hue, sat, lit)
+                
+                if not self._is_request_stale(request_id):
+                    self.computation_progress.emit(rgb, view, is_final, iterations_full, max_iter)
 
 
 class MandelbrotWidget(QLabel):
-   """Widget displaying the Mandelbrot set with scroll-wheel zoom and click-drag pan."""
-   
-   view_changed = pyqtSignal(object, bool)
-   
-   def __init__(self, config: RenderConfig, parent=None):
-       super().__init__(parent)
-       
-       self.config = config
-       self.view = ViewState()
-       
-       # Mouse tracking state
-       self.current_mouse_pos: Optional[QPointF] = None
-       self.pan_start_pos: Optional[QPointF] = None
-       self.pan_start_view: Optional[ViewState] = None
-       self.is_panning = False
-       
-       # Zoom settings
-       self.zoom_factor = 1.5
-       
-       # Calculate maximum zoom based on float64 precision
-       initial_pixel_spacing = self.view.initial_width / self.config.width
-       self.max_zoom = initial_pixel_spacing / self.config.min_pixel_spacing
-       
-       # Set up the widget
-       self.setFixedSize(config.width, config.height)
-       self.setMouseTracking(True)
-       self.setCursor(Qt.CursorShape.CrossCursor)
-       
-       # Create and start the compute worker
-       self.worker = ComputeWorker(config)
-       self.worker.computation_progress.connect(self._on_computation_progress)
-       self.worker.start()
-       
-       # Track render state
-       self.is_final_render = False
-       self.current_rgb_data: Optional[np.ndarray] = None
-       self.current_iterations: Optional[np.ndarray] = None
-       self.current_max_iter: int = config.max_iterations
-       
-       # Display initial loading state
-       self._show_loading_state()
-       
-       # Request initial computation
-       self.worker.request_computation(self.view)
-   
-   def _show_loading_state(self) -> None:
-       """Display a placeholder while computing."""
-       grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
-       self._display_rgb_array(grey)
-   
-   def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
-       """Convert numpy RGB array to QPixmap and display."""
-       height, width, channels = rgb_array.shape
-       bytes_per_line = channels * width
-       
-       rgb_contiguous = np.ascontiguousarray(rgb_array)
-       
-       qimage = QImage(
-           rgb_contiguous.data,
-           width,
-           height,
-           bytes_per_line,
-           QImage.Format.Format_RGB888
-       )
-       
-       # Keep reference to prevent garbage collection
-       self._current_image_data = rgb_contiguous
-       self.current_rgb_data = rgb_contiguous.copy()
-       
-       self.setPixmap(QPixmap.fromImage(qimage))
-   
-   def _on_computation_progress(self, rgb_array: np.ndarray,
-                                 view: ViewState, is_final: bool,
-                                 iterations: Optional[np.ndarray] = None,
-                                 max_iter: int = 256) -> None:
-       """Handle progressive rendering updates."""
-       self._display_rgb_array(rgb_array)
-       self.is_final_render = is_final
-       if iterations is not None:
-           self.current_iterations = iterations.copy()
-           self.current_max_iter = max_iter
-       self.view_changed.emit(view, is_final)
-   
-   def update_colours(self, hue: float, saturation: float, lightness: float) -> None:
-       """Update colour parameters and recolour current image."""
-       self.worker.set_colour_params(hue, saturation, lightness)
-       
-       # If we have cached iteration data, recolour immediately
-       if self.current_iterations is not None:
-           rgb = colour_selector(
-               self.current_iterations,
-               self.current_max_iter,
-               hue, saturation, lightness
-           )
-           self._display_rgb_array(rgb)
-   
-   def mousePressEvent(self, event: QMouseEvent) -> None:
-       """Handle mouse press to initiate panning."""
-       if event.button() == Qt.MouseButton.LeftButton:
-           self.is_panning = True
-           self.pan_start_pos = event.position()
-           self.pan_start_view = self.view.copy()
-           self.setCursor(Qt.CursorShape.ClosedHandCursor)
-       
-       super().mousePressEvent(event)
-   
-   def mouseMoveEvent(self, event: QMouseEvent) -> None:
-       """Handle mouse movement for tracking and panning."""
-       self.current_mouse_pos = event.position()
-       
-       if self.is_panning and self.pan_start_pos is not None and self.pan_start_view is not None:
-           delta_x = event.position().x() - self.pan_start_pos.x()
-           delta_y = event.position().y() - self.pan_start_pos.y()
-           
-           complex_delta_x = -delta_x * (self.pan_start_view.current_width / self.config.width)
-           complex_delta_y = delta_y * (self.pan_start_view.current_height / self.config.height)
-           
-           self.view.centre_real = self.pan_start_view.centre_real + complex_delta_x
-           self.view.centre_imag = self.pan_start_view.centre_imag + complex_delta_y
-           
-           self.worker.request_computation(self.view)
-       
-       super().mouseMoveEvent(event)
-   
-   def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-       """Handle mouse release to end panning."""
-       if event.button() == Qt.MouseButton.LeftButton:
-           self.is_panning = False
-           self.pan_start_pos = None
-           self.pan_start_view = None
-           self.setCursor(Qt.CursorShape.CrossCursor)
-       
-       super().mouseReleaseEvent(event)
-   
-   def wheelEvent(self, event: QWheelEvent) -> None:
-       """Handle scroll wheel for zooming."""
-       if self.is_panning:
-           return
-       
-       delta = event.angleDelta().y()
-       
-       if delta == 0:
-           return
-       
-       if delta > 0:
-           new_zoom = self.view.zoom_level * self.zoom_factor
-       else:
-           new_zoom = self.view.zoom_level / self.zoom_factor
-       
-       # Enforce zoom limits
-       if new_zoom < 1.0:
-           new_zoom = 1.0
-       elif new_zoom > self.max_zoom:
-           new_zoom = self.max_zoom
-           if self.view.zoom_level >= self.max_zoom:
-               return
-       
-       # Get zoom centre point (mouse position)
-       pos = event.position()
-       zoom_x = pos.x()
-       zoom_y = pos.y()
-       
-       # Convert pixel position to complex coordinates (before zoom)
-       complex_x, complex_y = self.view.pixel_to_complex(
-           int(zoom_x), int(zoom_y),
-           self.config.width, self.config.height
-       )
-       
-       # Calculate relative position of mouse in view (0 to 1)
-       rel_x = zoom_x / self.config.width
-       rel_y = zoom_y / self.config.height
-       
-       # Update zoom level
-       self.view.zoom_level = new_zoom
-       
-       # Adjust centre so point under mouse stays fixed
-       new_width = self.view.current_width
-       new_height = self.view.current_height
-       
-       self.view.centre_real = complex_x - (rel_x - 0.5) * new_width
-       self.view.centre_imag = complex_y + (rel_y - 0.5) * new_height
-       
-       # Request new computation
-       self.worker.request_computation(self.view)
-   
-   def get_current_image(self) -> Optional[np.ndarray]:
-       """Return the current RGB image data."""
-       return self.current_rgb_data
-   
-   def get_current_view(self) -> ViewState:
-       """Return a copy of the current view state."""
-       return self.view.copy()
-   
-   def cleanup(self) -> None:
-       """Stop the worker thread."""
-       self.worker.stop()
+    """Widget displaying the Mandelbrot set with scroll-wheel zoom and click-drag pan."""
+    
+    view_changed = pyqtSignal(object, bool)
+    
+    def __init__(self, config: RenderConfig, parent=None):
+        super().__init__(parent)
+        
+        self.config = config
+        self.view = ViewState()
+        
+        # Mouse tracking state
+        self.current_mouse_pos: Optional[QPointF] = None
+        self.pan_start_pos: Optional[QPointF] = None
+        self.pan_start_view: Optional[ViewState] = None
+        self.is_panning = False
+        
+        # Zoom settings
+        self.zoom_factor = 1.5
+        
+        # Calculate maximum zoom based on float64 precision
+        initial_pixel_spacing = self.view.initial_width / self.config.width
+        self.max_zoom = initial_pixel_spacing / self.config.min_pixel_spacing
+        
+        # Set up the widget
+        self.setFixedSize(config.width, config.height)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        
+        # Create and start the compute worker
+        self.worker = ComputeWorker(config)
+        self.worker.computation_progress.connect(self._on_computation_progress)
+        self.worker.start()
+        
+        # Track render state
+        self.is_final_render = False
+        self.current_rgb_data: Optional[np.ndarray] = None
+        self.current_iterations: Optional[np.ndarray] = None
+        self.current_max_iter: int = config.max_iterations
+        
+        # Debounce timer for color changes
+        self.color_debounce_timer = QTimer()
+        self.color_debounce_timer.setSingleShot(True)
+        self.color_debounce_timer.timeout.connect(self._apply_color_change)
+        self.pending_color_params: Optional[Tuple[float, float, float]] = None
+        
+        # Display initial loading state
+        self._show_loading_state()
+        
+        # Request initial computation
+        self.worker.request_computation(self.view)
+    
+    def _show_loading_state(self) -> None:
+        """Display a placeholder while computing."""
+        grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
+        self._display_rgb_array(grey)
+    
+    def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
+        """Convert numpy RGB array to QPixmap and display."""
+        height, width, channels = rgb_array.shape
+        bytes_per_line = channels * width
+        
+        rgb_contiguous = np.ascontiguousarray(rgb_array)
+        
+        qimage = QImage(
+            rgb_contiguous.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format.Format_RGB888
+        )
+        
+        # Keep reference to prevent garbage collection
+        self._current_image_data = rgb_contiguous
+        self.current_rgb_data = rgb_contiguous.copy()
+        
+        self.setPixmap(QPixmap.fromImage(qimage))
+    
+    def _on_computation_progress(self, rgb_array: np.ndarray,
+                                  view: ViewState, is_final: bool,
+                                  iterations: Optional[np.ndarray] = None,
+                                  max_iter: int = 256) -> None:
+        """Handle progressive rendering updates."""
+        self._display_rgb_array(rgb_array)
+        self.is_final_render = is_final
+        if iterations is not None:
+            self.current_iterations = iterations.copy()
+            self.current_max_iter = max_iter
+        self.view_changed.emit(view, is_final)
+    
+    def update_colours(self, hue: float, saturation: float, lightness: float) -> None:
+        """Update colour parameters with instant local recoloring and debounced worker update."""
+        # Instant local recolor for immediate feedback
+        if self.current_iterations is not None:
+            rgb = colour_selector(
+                self.current_iterations,
+                self.current_max_iter,
+                hue, saturation, lightness
+            )
+            self._display_rgb_array(rgb)
+        
+        # Debounce worker update (for when we need to recolor cached data)
+        self.pending_color_params = (hue, saturation, lightness)
+        self.color_debounce_timer.start(100)  # Wait 100ms for more changes
+    
+    def _apply_color_change(self) -> None:
+        """Apply debounced color change to worker."""
+        if self.pending_color_params:
+            hue, sat, lit = self.pending_color_params
+            self.worker.set_colour_params(hue, sat, lit)
+            self.pending_color_params = None
+    
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse press to initiate panning."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_panning = True
+            self.pan_start_pos = event.position()
+            self.pan_start_view = self.view.copy()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        
+        super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse movement for tracking and panning."""
+        self.current_mouse_pos = event.position()
+        
+        if self.is_panning and self.pan_start_pos is not None and self.pan_start_view is not None:
+            delta_x = event.position().x() - self.pan_start_pos.x()
+            delta_y = event.position().y() - self.pan_start_pos.y()
+            
+            complex_delta_x = -delta_x * (self.pan_start_view.current_width / self.config.width)
+            complex_delta_y = delta_y * (self.pan_start_view.current_height / self.config.height)
+            
+            self.view.centre_real = self.pan_start_view.centre_real + complex_delta_x
+            self.view.centre_imag = self.pan_start_view.centre_imag + complex_delta_y
+            
+            self.worker.request_computation(self.view)
+        
+        super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse release to end panning."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_panning = False
+            self.pan_start_pos = None
+            self.pan_start_view = None
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        
+        super().mouseReleaseEvent(event)
+    
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Handle scroll wheel for zooming."""
+        if self.is_panning:
+            return
+        
+        delta = event.angleDelta().y()
+        
+        if delta == 0:
+            return
+        
+        if delta > 0:
+            new_zoom = self.view.zoom_level * self.zoom_factor
+        else:
+            new_zoom = self.view.zoom_level / self.zoom_factor
+        
+        # Enforce zoom limits
+        if new_zoom < 1.0:
+            new_zoom = 1.0
+        elif new_zoom > self.max_zoom:
+            new_zoom = self.max_zoom
+            if self.view.zoom_level >= self.max_zoom:
+                return
+        
+        # Get zoom centre point (mouse position)
+        pos = event.position()
+        zoom_x = pos.x()
+        zoom_y = pos.y()
+        
+        # Convert pixel position to complex coordinates (before zoom)
+        complex_x, complex_y = self.view.pixel_to_complex(
+            int(zoom_x), int(zoom_y),
+            self.config.width, self.config.height
+        )
+        
+        # Calculate relative position of mouse in view (0 to 1)
+        rel_x = zoom_x / self.config.width
+        rel_y = zoom_y / self.config.height
+        
+        # Update zoom level
+        self.view.zoom_level = new_zoom
+        
+        # Adjust centre so point under mouse stays fixed
+        new_width = self.view.current_width
+        new_height = self.view.current_height
+        
+        self.view.centre_real = complex_x - (rel_x - 0.5) * new_width
+        self.view.centre_imag = complex_y + (rel_y - 0.5) * new_height
+        
+        # Request new computation
+        self.worker.request_computation(self.view)
+    
+    def get_current_image(self) -> Optional[np.ndarray]:
+        """Return the current RGB image data."""
+        return self.current_rgb_data
+    
+    def get_current_view(self) -> ViewState:
+        """Return a copy of the current view state."""
+        return self.view.copy()
+    
+    def cleanup(self) -> None:
+        """Stop the worker thread."""
+        self.color_debounce_timer.stop()
+        self.worker.stop()
 
 
 class ImageSaver:
