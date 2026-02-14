@@ -331,6 +331,34 @@ def colour_selector(iterations: np.ndarray, max_iterations: int,
         max_external
     )
 
+def keyboard_shortcuts(key: int) -> Optional[Tuple[str, float]]:
+    """
+    Map keyboard keys to navigation actions.
+    
+    Args:
+        key: Qt key code from the key event.
+        
+    Returns:
+        Tuple of (action_type, value) or None if key not mapped.
+        Action types: 'pan_x', 'pan_y', 'zoom', 'reset'
+        Values: direction/factor for pan/zoom, 0 for reset.
+    """
+    key_mappings = {
+        # WASD panning (value is direction multiplier)
+        Qt.Key.Key_W: ('pan_y', 1.0),   # Pan up (positive imaginary)
+        Qt.Key.Key_S: ('pan_y', -1.0),  # Pan down (negative imaginary)
+        Qt.Key.Key_A: ('pan_x', -1.0),  # Pan left (negative real)
+        Qt.Key.Key_D: ('pan_x', 1.0),   # Pan right (positive real)
+        
+        # QE zooming (value is zoom multiplier)
+        Qt.Key.Key_Q: ('zoom', 0.5),    # Zoom out (decrease zoom level)
+        Qt.Key.Key_E: ('zoom', 2.0),    # Zoom in (increase zoom level)
+        
+        # Reset
+        Qt.Key.Key_R: ('reset', 0.0),   # Reset to initial view
+    }
+    
+    return key_mappings.get(key)
 
 class TileCache:
    """Cache for computed Mandelbrot tiles."""
@@ -558,202 +586,256 @@ class ComputeWorker(QThread):
 
 
 class MandelbrotWidget(QLabel):
-   """Widget displaying the Mandelbrot set with scroll-wheel zoom and click-drag pan."""
-   
-   view_changed = pyqtSignal(object, bool)
-   
-   def __init__(self, config: RenderConfig, parent=None):
-       super().__init__(parent)
-       
-       self.config = config
-       self.view = ViewState()
-       
-       # Mouse tracking state
-       self.current_mouse_pos: Optional[QPointF] = None
-       self.pan_start_pos: Optional[QPointF] = None
-       self.pan_start_view: Optional[ViewState] = None
-       self.is_panning = False
-       
-       # Zoom settings
-       self.zoom_factor = 1.5
-       
-       # Calculate maximum zoom based on float64 precision
-       initial_pixel_spacing = self.view.initial_width / self.config.width
-       self.max_zoom = initial_pixel_spacing / self.config.min_pixel_spacing
-       
-       # Set up the widget
-       self.setFixedSize(config.width, config.height)
-       self.setMouseTracking(True)
-       self.setCursor(Qt.CursorShape.CrossCursor)
-       
-       # Create and start the compute worker
-       self.worker = ComputeWorker(config)
-       self.worker.computation_progress.connect(self._on_computation_progress)
-       self.worker.start()
-       
-       # Track render state
-       self.is_final_render = False
-       self.current_rgb_data: Optional[np.ndarray] = None
-       self.current_iterations: Optional[np.ndarray] = None
-       self.current_max_iter: int = config.max_iterations
-       
-       # Display initial loading state
-       self._show_loading_state()
-       
-       # Request initial computation
-       self.worker.request_computation(self.view)
-   
-   def _show_loading_state(self) -> None:
-       """Display a placeholder while computing."""
-       grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
-       self._display_rgb_array(grey)
-   
-   def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
-       """Convert numpy RGB array to QPixmap and display."""
-       height, width, channels = rgb_array.shape
-       bytes_per_line = channels * width
-       
-       rgb_contiguous = np.ascontiguousarray(rgb_array)
-       
-       qimage = QImage(
-           rgb_contiguous.data,
-           width,
-           height,
-           bytes_per_line,
-           QImage.Format.Format_RGB888
-       )
-       
-       # Keep reference to prevent garbage collection
-       self._current_image_data = rgb_contiguous
-       self.current_rgb_data = rgb_contiguous.copy()
-       
-       self.setPixmap(QPixmap.fromImage(qimage))
-   
-   def _on_computation_progress(self, rgb_array: np.ndarray,
-                                 view: ViewState, is_final: bool,
-                                 iterations: Optional[np.ndarray] = None,
-                                 max_iter: int = 256) -> None:
-       """Handle progressive rendering updates."""
-       self._display_rgb_array(rgb_array)
-       self.is_final_render = is_final
-       if iterations is not None:
-           self.current_iterations = iterations.copy()
-           self.current_max_iter = max_iter
-       self.view_changed.emit(view, is_final)
-   
-   def update_colours(self, hue: float, saturation: float, lightness: float) -> None:
-       """Update colour parameters and recolour current image."""
-       self.worker.set_colour_params(hue, saturation, lightness)
-       
-       # If we have cached iteration data, recolour immediately
-       if self.current_iterations is not None:
-           rgb = colour_selector(
-               self.current_iterations,
-               self.current_max_iter,
-               hue, saturation, lightness
-           )
-           self._display_rgb_array(rgb)
-   
-   def mousePressEvent(self, event: QMouseEvent) -> None:
-       """Handle mouse press to initiate panning."""
-       if event.button() == Qt.MouseButton.LeftButton:
-           self.is_panning = True
-           self.pan_start_pos = event.position()
-           self.pan_start_view = self.view.copy()
-           self.setCursor(Qt.CursorShape.ClosedHandCursor)
-       
-       super().mousePressEvent(event)
-   
-   def mouseMoveEvent(self, event: QMouseEvent) -> None:
-       """Handle mouse movement for tracking and panning."""
-       self.current_mouse_pos = event.position()
-       
-       if self.is_panning and self.pan_start_pos is not None and self.pan_start_view is not None:
-           delta_x = event.position().x() - self.pan_start_pos.x()
-           delta_y = event.position().y() - self.pan_start_pos.y()
-           
-           complex_delta_x = -delta_x * (self.pan_start_view.current_width / self.config.width)
-           complex_delta_y = delta_y * (self.pan_start_view.current_height / self.config.height)
-           
-           self.view.centre_real = self.pan_start_view.centre_real + complex_delta_x
-           self.view.centre_imag = self.pan_start_view.centre_imag + complex_delta_y
-           
-           self.worker.request_computation(self.view)
-       
-       super().mouseMoveEvent(event)
-   
-   def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-       """Handle mouse release to end panning."""
-       if event.button() == Qt.MouseButton.LeftButton:
-           self.is_panning = False
-           self.pan_start_pos = None
-           self.pan_start_view = None
-           self.setCursor(Qt.CursorShape.CrossCursor)
-       
-       super().mouseReleaseEvent(event)
-   
-   def wheelEvent(self, event: QWheelEvent) -> None:
-       """Handle scroll wheel for zooming."""
-       if self.is_panning:
-           return
-       
-       delta = event.angleDelta().y()
-       
-       if delta == 0:
-           return
-       
-       if delta > 0:
-           new_zoom = self.view.zoom_level * self.zoom_factor
-       else:
-           new_zoom = self.view.zoom_level / self.zoom_factor
-       
-       # Enforce zoom limits
-       if new_zoom < 1.0:
-           new_zoom = 1.0
-       elif new_zoom > self.max_zoom:
-           new_zoom = self.max_zoom
-           if self.view.zoom_level >= self.max_zoom:
-               return
-       
-       # Get zoom centre point (mouse position)
-       pos = event.position()
-       zoom_x = pos.x()
-       zoom_y = pos.y()
-       
-       # Convert pixel position to complex coordinates (before zoom)
-       complex_x, complex_y = self.view.pixel_to_complex(
-           int(zoom_x), int(zoom_y),
-           self.config.width, self.config.height
-       )
-       
-       # Calculate relative position of mouse in view (0 to 1)
-       rel_x = zoom_x / self.config.width
-       rel_y = zoom_y / self.config.height
-       
-       # Update zoom level
-       self.view.zoom_level = new_zoom
-       
-       # Adjust centre so point under mouse stays fixed
-       new_width = self.view.current_width
-       new_height = self.view.current_height
-       
-       self.view.centre_real = complex_x - (rel_x - 0.5) * new_width
-       self.view.centre_imag = complex_y + (rel_y - 0.5) * new_height
-       
-       # Request new computation
-       self.worker.request_computation(self.view)
-   
-   def get_current_image(self) -> Optional[np.ndarray]:
-       """Return the current RGB image data."""
-       return self.current_rgb_data
-   
-   def get_current_view(self) -> ViewState:
-       """Return a copy of the current view state."""
-       return self.view.copy()
-   
-   def cleanup(self) -> None:
-       """Stop the worker thread."""
-       self.worker.stop()
+    """Widget displaying the Mandelbrot set with scroll-wheel zoom and click-drag pan."""
+    
+    view_changed = pyqtSignal(object, bool)
+    
+    def __init__(self, config: RenderConfig, parent=None):
+        super().__init__(parent)
+        
+        self.config = config
+        self.view = ViewState()
+        
+        # Mouse tracking state
+        self.current_mouse_pos: Optional[QPointF] = None
+        self.pan_start_pos: Optional[QPointF] = None
+        self.pan_start_view: Optional[ViewState] = None
+        self.is_panning = False
+        
+        # Zoom settings
+        self.zoom_factor = 1.5
+        
+        # Calculate maximum zoom based on float64 precision
+        initial_pixel_spacing = self.view.initial_width / self.config.width
+        self.max_zoom = initial_pixel_spacing / self.config.min_pixel_spacing
+        
+        # Set up the widget
+        self.setFixedSize(config.width, config.height)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        
+        # Create and start the compute worker
+        self.worker = ComputeWorker(config)
+        self.worker.computation_progress.connect(self._on_computation_progress)
+        self.worker.start()
+        
+        # Track render state
+        self.is_final_render = False
+        self.current_rgb_data: Optional[np.ndarray] = None
+        self.current_iterations: Optional[np.ndarray] = None
+        self.current_max_iter: int = config.max_iterations
+        
+        # Display initial loading state
+        self._show_loading_state()
+        
+        # Request initial computation
+        self.worker.request_computation(self.view)
+    
+    def _show_loading_state(self) -> None:
+        """Display a placeholder while computing."""
+        grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
+        self._display_rgb_array(grey)
+    
+    def handle_keyboard_navigation(self, key: int) -> bool:
+        """
+        Process keyboard navigation input.
+        
+        Args:
+            key: Qt key code from the key event.
+            
+        Returns:
+            True if the key was handled, False otherwise.
+        """
+        action = keyboard_shortcuts(key)
+        
+        if action is None:
+            return False
+        
+        action_type, value = action
+        
+        # Pan distance as fraction of current view
+        pan_fraction = 0.2
+        
+        if action_type == 'pan_x':
+            # Pan horizontally
+            pan_amount = self.view.current_width * pan_fraction * value
+            self.view.centre_real += pan_amount
+            self.worker.request_computation(self.view)
+            
+        elif action_type == 'pan_y':
+            # Pan vertically
+            pan_amount = self.view.current_height * pan_fraction * value
+            self.view.centre_imag += pan_amount
+            self.worker.request_computation(self.view)
+            
+        elif action_type == 'zoom':
+            # Zoom in/out from centre
+            new_zoom = self.view.zoom_level * value
+            
+            # Enforce zoom limits
+            if new_zoom < 1.0:
+                new_zoom = 1.0
+            elif new_zoom > self.max_zoom:
+                new_zoom = self.max_zoom
+                if self.view.zoom_level >= self.max_zoom:
+                    return True
+            
+            self.view.zoom_level = new_zoom
+            self.worker.request_computation(self.view)
+            
+        elif action_type == 'reset':
+            # Reset to initial view
+            self.view = ViewState()
+            self.worker.request_computation(self.view)
+        
+        return True
+
+    def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
+        """Convert numpy RGB array to QPixmap and display."""
+        height, width, channels = rgb_array.shape
+        bytes_per_line = channels * width
+        
+        rgb_contiguous = np.ascontiguousarray(rgb_array)
+        
+        qimage = QImage(
+            rgb_contiguous.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format.Format_RGB888
+        )
+        
+        # Keep reference to prevent garbage collection
+        self._current_image_data = rgb_contiguous
+        self.current_rgb_data = rgb_contiguous.copy()
+        
+        self.setPixmap(QPixmap.fromImage(qimage))
+    
+    def _on_computation_progress(self, rgb_array: np.ndarray,
+                                    view: ViewState, is_final: bool,
+                                    iterations: Optional[np.ndarray] = None,
+                                    max_iter: int = 256) -> None:
+        """Handle progressive rendering updates."""
+        self._display_rgb_array(rgb_array)
+        self.is_final_render = is_final
+        if iterations is not None:
+            self.current_iterations = iterations.copy()
+            self.current_max_iter = max_iter
+        self.view_changed.emit(view, is_final)
+    
+    def update_colours(self, hue: float, saturation: float, lightness: float) -> None:
+        """Update colour parameters and recolour current image."""
+        self.worker.set_colour_params(hue, saturation, lightness)
+        
+        # If we have cached iteration data, recolour immediately
+        if self.current_iterations is not None:
+            rgb = colour_selector(
+                self.current_iterations,
+                self.current_max_iter,
+                hue, saturation, lightness
+            )
+            self._display_rgb_array(rgb)
+    
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse press to initiate panning."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_panning = True
+            self.pan_start_pos = event.position()
+            self.pan_start_view = self.view.copy()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        
+        super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse movement for tracking and panning."""
+        self.current_mouse_pos = event.position()
+        
+        if self.is_panning and self.pan_start_pos is not None and self.pan_start_view is not None:
+            delta_x = event.position().x() - self.pan_start_pos.x()
+            delta_y = event.position().y() - self.pan_start_pos.y()
+            
+            complex_delta_x = -delta_x * (self.pan_start_view.current_width / self.config.width)
+            complex_delta_y = delta_y * (self.pan_start_view.current_height / self.config.height)
+            
+            self.view.centre_real = self.pan_start_view.centre_real + complex_delta_x
+            self.view.centre_imag = self.pan_start_view.centre_imag + complex_delta_y
+            
+            self.worker.request_computation(self.view)
+        
+        super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse release to end panning."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_panning = False
+            self.pan_start_pos = None
+            self.pan_start_view = None
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        
+        super().mouseReleaseEvent(event)
+    
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Handle scroll wheel for zooming."""
+        if self.is_panning:
+            return
+        
+        delta = event.angleDelta().y()
+        
+        if delta == 0:
+            return
+        
+        if delta > 0:
+            new_zoom = self.view.zoom_level * self.zoom_factor
+        else:
+            new_zoom = self.view.zoom_level / self.zoom_factor
+        
+        # Enforce zoom limits
+        if new_zoom < 1.0:
+            new_zoom = 1.0
+        elif new_zoom > self.max_zoom:
+            new_zoom = self.max_zoom
+            if self.view.zoom_level >= self.max_zoom:
+                return
+        
+        # Get zoom centre point (mouse position)
+        pos = event.position()
+        zoom_x = pos.x()
+        zoom_y = pos.y()
+        
+        # Convert pixel position to complex coordinates (before zoom)
+        complex_x, complex_y = self.view.pixel_to_complex(
+            int(zoom_x), int(zoom_y),
+            self.config.width, self.config.height
+        )
+        
+        # Calculate relative position of mouse in view (0 to 1)
+        rel_x = zoom_x / self.config.width
+        rel_y = zoom_y / self.config.height
+        
+        # Update zoom level
+        self.view.zoom_level = new_zoom
+        
+        # Adjust centre so point under mouse stays fixed
+        new_width = self.view.current_width
+        new_height = self.view.current_height
+        
+        self.view.centre_real = complex_x - (rel_x - 0.5) * new_width
+        self.view.centre_imag = complex_y + (rel_y - 0.5) * new_height
+        
+        # Request new computation
+        self.worker.request_computation(self.view)
+    
+    def get_current_image(self) -> Optional[np.ndarray]:
+        """Return the current RGB image data."""
+        return self.current_rgb_data
+    
+    def get_current_view(self) -> ViewState:
+        """Return a copy of the current view state."""
+        return self.view.copy()
+    
+    def cleanup(self) -> None:
+        """Stop the worker thread."""
+        self.worker.stop()
 
 
 class ImageSaver:
@@ -836,254 +918,261 @@ class ImageSaver:
 
 
 class MandelbrotWindow(QMainWindow):
-   """Main application window with save functionality."""
-   
-   def __init__(self):
-       super().__init__()
-       
-       self.setWindowTitle("Mandelbrot Set Viewer")
-       
-       # Create render configuration
-       self.config = RenderConfig(
-           width=800,
-           height=600,
-           max_iterations=256
-       )
-       
-       # Create central widget
-       central_widget = QWidget()
-       self.setCentralWidget(central_widget)
-       
-       # Create layout
-       layout = QVBoxLayout(central_widget)
-       layout.setContentsMargins(0, 0, 0, 0)
-       layout.setSpacing(0)
-       
-       # Create Mandelbrot display widget
-       self.mandelbrot_widget = MandelbrotWidget(self.config)
-       layout.addWidget(self.mandelbrot_widget)
-       
-       # Create status bar
-       self.status_label = QLabel()
-       self.status_label.setStyleSheet(
-           "padding: 8px; "
-           "background-color: #2d2d2d; "
-           "color: #e0e0e0; "
-           "font-family: monospace; "
-           "font-size: 11px;"
-       )
-       self._update_status()
-       layout.addWidget(self.status_label)
-       
-       # Create colour control sliders
-       colour_group = QGroupBox("Colour Controls")
-       colour_group.setStyleSheet("""
-           QGroupBox {
-               color: #e0e0e0;
-               border: 1px solid #404040;
-               margin-top: 10px;
-               padding-top: 10px;
-           }
-           QGroupBox::title {
-               subcontrol-origin: margin;
-               left: 10px;
-               padding: 0 5px;
-           }
-       """)
-       colour_layout = QVBoxLayout(colour_group)
-       
-       # Hue slider
-       hue_layout = QHBoxLayout()
-       hue_label = QLabel("Hue:")
-       hue_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
-       self.hue_slider = QSlider(Qt.Orientation.Horizontal)
-       self.hue_slider.setRange(0, 100)
-       self.hue_slider.setValue(0)
-       self.hue_slider.setStyleSheet(self._slider_style())
-       self.hue_value_label = QLabel("0%")
-       self.hue_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
-       hue_layout.addWidget(hue_label)
-       hue_layout.addWidget(self.hue_slider)
-       hue_layout.addWidget(self.hue_value_label)
-       colour_layout.addLayout(hue_layout)
-       
-       # Saturation slider
-       sat_layout = QHBoxLayout()
-       sat_label = QLabel("Saturation:")
-       sat_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
-       self.sat_slider = QSlider(Qt.Orientation.Horizontal)
-       self.sat_slider.setRange(0, 100)
-       self.sat_slider.setValue(100)
-       self.sat_slider.setStyleSheet(self._slider_style())
-       self.sat_value_label = QLabel("100%")
-       self.sat_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
-       sat_layout.addWidget(sat_label)
-       sat_layout.addWidget(self.sat_slider)
-       sat_layout.addWidget(self.sat_value_label)
-       colour_layout.addLayout(sat_layout)
-       
-       # Lightness slider
-       lit_layout = QHBoxLayout()
-       lit_label = QLabel("Lightness:")
-       lit_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
-       self.lit_slider = QSlider(Qt.Orientation.Horizontal)
-       self.lit_slider.setRange(0, 100)
-       self.lit_slider.setValue(50)
-       self.lit_slider.setStyleSheet(self._slider_style())
-       self.lit_value_label = QLabel("50%")
-       self.lit_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
-       lit_layout.addWidget(lit_label)
-       lit_layout.addWidget(self.lit_slider)
-       lit_layout.addWidget(self.lit_value_label)
-       colour_layout.addLayout(lit_layout)
-       
-       layout.addWidget(colour_group)
-       
-       # Create instructions label
-       self.instructions_label = QLabel(
-           "Scroll: Zoom  |  Drag: Pan  |  Ctrl+S: Save Image"
-       )
-       self.instructions_label.setStyleSheet(
-           "padding: 5px; "
-           "background-color: #1a1a1a; "
-           "color: #888888; "
-           "font-size: 10px;"
-       )
-       self.instructions_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-       layout.addWidget(self.instructions_label)
-       
-       # Connect signals
-       self.mandelbrot_widget.view_changed.connect(self._on_view_changed)
-       self.hue_slider.valueChanged.connect(self._on_colour_changed)
-       self.sat_slider.valueChanged.connect(self._on_colour_changed)
-       self.lit_slider.valueChanged.connect(self._on_colour_changed)
-       
-       # Size window to fit contents
-       self.adjustSize()
-       self.setMinimumSize(self.sizeHint())
-   
-   def _slider_style(self) -> str:
-       """Return stylesheet for sliders."""
-       return """
-           QSlider::groove:horizontal {
-               border: 1px solid #404040;
-               height: 8px;
-               background: #2d2d2d;
-               margin: 2px 0;
-               border-radius: 4px;
-           }
-           QSlider::handle:horizontal {
-               background: #606060;
-               border: 1px solid #808080;
-               width: 18px;
-               margin: -5px 0;
-               border-radius: 9px;
-           }
-           QSlider::handle:horizontal:hover {
-               background: #707070;
-           }
-           QSlider::sub-page:horizontal {
-               background: #4a90d9;
-               border-radius: 4px;
-           }
-       """
-   
-   def _on_colour_changed(self) -> None:
-       """Handle colour slider changes."""
-       hue = self.hue_slider.value() / 100.0
-       saturation = self.sat_slider.value() / 100.0
-       lightness = self.lit_slider.value() / 100.0
-       
-       # Update labels
-       self.hue_value_label.setText(f"{self.hue_slider.value()}%")
-       self.sat_value_label.setText(f"{self.sat_slider.value()}%")
-       self.lit_value_label.setText(f"{self.lit_slider.value()}%")
-       
-       # Update colours
-       self.mandelbrot_widget.update_colours(hue, saturation, lightness)
-   
-   def _update_status(self) -> None:
-       """Update the status label with current view information."""
-       view = self.mandelbrot_widget.view
-       
-       # Check if at precision limit
-       at_limit = view.zoom_level >= self.mandelbrot_widget.max_zoom * 0.99
-       limit_warning = "  ⚠ PRECISION LIMIT" if at_limit else ""
-       
-       # Render quality indicator
-       quality = "●" if self.mandelbrot_widget.is_final_render else "○"
-       
-       self.status_label.setText(
-           f"{quality} Centre: ({view.centre_real:.10g}, {view.centre_imag:.10g})  │  "
-           f"Zoom: {view.zoom_level:.4e}x{limit_warning}"
-       )
-   
-   def _on_view_changed(self, view: ViewState, is_final: bool) -> None:
-       """Called when the view has been updated."""
-       self._update_status()
-   
-   def keyPressEvent(self, event) -> None:
-       """Handle keyboard shortcuts."""
-       if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-           if event.key() == Qt.Key.Key_S:
-               self._save_image()
-               return
-       
-       super().keyPressEvent(event)
-   
-   def _save_image(self) -> None:
-       """Open save dialog and save current view."""
-       rgb_data = self.mandelbrot_widget.get_current_image()
-       
-       if rgb_data is None:
-           QMessageBox.warning(
-               self,
-               "Cannot Save",
-               "No image data available to save."
-           )
-           return
-       
-       view = self.mandelbrot_widget.get_current_view()
-       suggested_name = ImageSaver.generate_filename(view)
-       
-       filepath, _ = QFileDialog.getSaveFileName(
-           self,
-           "Save Mandelbrot Image",
-           suggested_name,
-           "PNG Images (*.png);;All Files (*)"
-       )
-       
-       if not filepath:
-           return
-       
-       if not filepath.lower().endswith('.png'):
-           filepath += '.png'
-       
-       success = ImageSaver.save_image(
-           rgb_data,
-           view,
-           Path(filepath),
-           embed_text=True
-       )
-       
-       if success:
-           QMessageBox.information(
-               self,
-               "Image Saved",
-               f"Image saved successfully to:\n{filepath}\n\n"
-               f"Coordinates embedded in image metadata."
-           )
-       else:
-           QMessageBox.critical(
-               self,
-               "Save Failed",
-               "Failed to save the image. Please try again."
-           )
-   
-   def closeEvent(self, event) -> None:
-       """Clean up worker thread on close."""
-       self.mandelbrot_widget.cleanup()
-       super().closeEvent(event)
+    """Main application window with save functionality."""
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.setWindowTitle("Mandelbrot Set Viewer")
+        
+        # Create render configuration
+        self.config = RenderConfig(
+            width=800,
+            height=600,
+            max_iterations=256
+        )
+        
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Create layout
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Create Mandelbrot display widget
+        self.mandelbrot_widget = MandelbrotWidget(self.config)
+        layout.addWidget(self.mandelbrot_widget)
+        
+        # Create status bar
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            "padding: 8px; "
+            "background-color: #2d2d2d; "
+            "color: #e0e0e0; "
+            "font-family: monospace; "
+            "font-size: 11px;"
+        )
+        self._update_status()
+        layout.addWidget(self.status_label)
+        
+        # Create colour control sliders
+        colour_group = QGroupBox("Colour Controls")
+        colour_group.setStyleSheet("""
+            QGroupBox {
+                color: #e0e0e0;
+                border: 1px solid #404040;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        colour_layout = QVBoxLayout(colour_group)
+        
+        # Hue slider
+        hue_layout = QHBoxLayout()
+        hue_label = QLabel("Hue:")
+        hue_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.hue_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hue_slider.setRange(0, 100)
+        self.hue_slider.setValue(0)
+        self.hue_slider.setStyleSheet(self._slider_style())
+        self.hue_value_label = QLabel("0%")
+        self.hue_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        hue_layout.addWidget(hue_label)
+        hue_layout.addWidget(self.hue_slider)
+        hue_layout.addWidget(self.hue_value_label)
+        colour_layout.addLayout(hue_layout)
+        
+        # Saturation slider
+        sat_layout = QHBoxLayout()
+        sat_label = QLabel("Saturation:")
+        sat_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.sat_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sat_slider.setRange(0, 100)
+        self.sat_slider.setValue(100)
+        self.sat_slider.setStyleSheet(self._slider_style())
+        self.sat_value_label = QLabel("100%")
+        self.sat_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        sat_layout.addWidget(sat_label)
+        sat_layout.addWidget(self.sat_slider)
+        sat_layout.addWidget(self.sat_value_label)
+        colour_layout.addLayout(sat_layout)
+        
+        # Lightness slider
+        lit_layout = QHBoxLayout()
+        lit_label = QLabel("Lightness:")
+        lit_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.lit_slider = QSlider(Qt.Orientation.Horizontal)
+        self.lit_slider.setRange(0, 100)
+        self.lit_slider.setValue(50)
+        self.lit_slider.setStyleSheet(self._slider_style())
+        self.lit_value_label = QLabel("50%")
+        self.lit_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        lit_layout.addWidget(lit_label)
+        lit_layout.addWidget(self.lit_slider)
+        lit_layout.addWidget(self.lit_value_label)
+        colour_layout.addLayout(lit_layout)
+        
+        layout.addWidget(colour_group)
+        
+        # Create instructions label
+        self.instructions_label = QLabel(
+            "Scroll/Q/E: Zoom  |  Drag/WASD: Pan  |  R: Reset  |  Ctrl+S: Save"
+        )
+        self.instructions_label.setStyleSheet(
+            "padding: 5px; "
+            "background-color: #1a1a1a; "
+            "color: #888888; "
+            "font-size: 10px;"
+        )
+        self.instructions_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.instructions_label)
+        
+        # Connect signals
+        self.mandelbrot_widget.view_changed.connect(self._on_view_changed)
+        self.hue_slider.valueChanged.connect(self._on_colour_changed)
+        self.sat_slider.valueChanged.connect(self._on_colour_changed)
+        self.lit_slider.valueChanged.connect(self._on_colour_changed)
+        
+        # Size window to fit contents
+        self.adjustSize()
+        self.setMinimumSize(self.sizeHint())
+    
+    def _slider_style(self) -> str:
+        """Return stylesheet for sliders."""
+        return """
+            QSlider::groove:horizontal {
+                border: 1px solid #404040;
+                height: 8px;
+                background: #2d2d2d;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #606060;
+                border: 1px solid #808080;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #707070;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4a90d9;
+                border-radius: 4px;
+            }
+        """
+    
+    def _on_colour_changed(self) -> None:
+        """Handle colour slider changes."""
+        hue = self.hue_slider.value() / 100.0
+        saturation = self.sat_slider.value() / 100.0
+        lightness = self.lit_slider.value() / 100.0
+        
+        # Update labels
+        self.hue_value_label.setText(f"{self.hue_slider.value()}%")
+        self.sat_value_label.setText(f"{self.sat_slider.value()}%")
+        self.lit_value_label.setText(f"{self.lit_slider.value()}%")
+        
+        # Update colours
+        self.mandelbrot_widget.update_colours(hue, saturation, lightness)
+    
+    def _update_status(self) -> None:
+        """Update the status label with current view information."""
+        view = self.mandelbrot_widget.view
+        
+        # Check if at precision limit
+        at_limit = view.zoom_level >= self.mandelbrot_widget.max_zoom * 0.99
+        limit_warning = "  ⚠ PRECISION LIMIT" if at_limit else ""
+        
+        # Render quality indicator
+        quality = "●" if self.mandelbrot_widget.is_final_render else "○"
+        
+        self.status_label.setText(
+            f"{quality} Centre: ({view.centre_real:.10g}, {view.centre_imag:.10g})  │  "
+            f"Zoom: {view.zoom_level:.4e}x{limit_warning}"
+        )
+    
+    def _on_view_changed(self, view: ViewState, is_final: bool) -> None:
+        """Called when the view has been updated."""
+        self._update_status()
+    
+    def keyPressEvent(self, event) -> None:
+        """Handle keyboard shortcuts."""
+        # Ctrl+S to save
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_S:
+                self._save_image()
+                return
+        
+        # Handle navigation keys (only when no modifiers pressed)
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            if self.mandelbrot_widget.handle_keyboard_navigation(event.key()):
+                return
+        
+        super().keyPressEvent(event)
+        
+    
+    def _save_image(self) -> None:
+        """Open save dialog and save current view."""
+        rgb_data = self.mandelbrot_widget.get_current_image()
+        
+        if rgb_data is None:
+            QMessageBox.warning(
+                self,
+                "Cannot Save",
+                "No image data available to save."
+            )
+            return
+        
+        view = self.mandelbrot_widget.get_current_view()
+        suggested_name = ImageSaver.generate_filename(view)
+        
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Mandelbrot Image",
+            suggested_name,
+            "PNG Images (*.png);;All Files (*)"
+        )
+        
+        if not filepath:
+            return
+        
+        if not filepath.lower().endswith('.png'):
+            filepath += '.png'
+        
+        success = ImageSaver.save_image(
+            rgb_data,
+            view,
+            Path(filepath),
+            embed_text=True
+        )
+        
+        if success:
+            QMessageBox.information(
+                self,
+                "Image Saved",
+                f"Image saved successfully to:\n{filepath}\n\n"
+                f"Coordinates embedded in image metadata."
+            )
+        else:
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                "Failed to save the image. Please try again."
+            )
+    
+    def closeEvent(self, event) -> None:
+        """Clean up worker thread on close."""
+        self.mandelbrot_widget.cleanup()
+        super().closeEvent(event)
 
 
 def main():

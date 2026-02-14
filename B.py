@@ -6,7 +6,6 @@ centred on mouse position, and precision limit detection.
 """
 
 import sys
-import time
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
@@ -18,7 +17,7 @@ from PyQt6.QtWidgets import (
    QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
    QWidget, QFileDialog, QMessageBox, QSlider, QGroupBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition
 from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QWheelEvent
 
 from PIL import Image, ImageDraw, ImageFont
@@ -218,86 +217,119 @@ def upscale_nearest(small: np.ndarray, factor: int) -> np.ndarray:
    return result
 
 
+@jit(nopython=True, parallel=True, cache=True, fastmath=True)
+def colour_selector_numba(iterations: np.ndarray, max_iterations: int,
+                          hue_shift: float, saturation: float,
+                          lightness: float, max_external: float) -> np.ndarray:
+    """
+    Numba JIT-compiled HSL colour conversion with parallel processing.
+    
+    Args:
+        iterations: 2D array of iteration counts.
+        max_iterations: Maximum iteration value.
+        hue_shift: Hue rotation in range [0, 1].
+        saturation: Saturation multiplier in range [0, 1].
+        lightness: Lightness adjustment in range [0, 1].
+        max_external: Pre-computed maximum iteration value for normalisation.
+        
+    Returns:
+        3D RGB array (height, width, 3).
+    """
+    height, width = iterations.shape
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    # Precompute constants
+    threshold = max_iterations - 1.0
+    inv_max_external = 1.0 / max_external if max_external > 0 else 1.0
+    
+    for y in prange(height):
+        for x in range(width):
+            val = iterations[y, x]
+            
+            # Points in the set are black
+            if val >= threshold:
+                rgb[y, x, 0] = 0
+                rgb[y, x, 1] = 0
+                rgb[y, x, 2] = 0
+                continue
+            
+            # Normalise and apply hue shift
+            normalised = val * inv_max_external
+            hue = (normalised + hue_shift) % 1.0
+            
+            # HSL to RGB conversion (inline)
+            c = (1.0 - abs(2.0 * lightness - 1.0)) * saturation
+            h_sector = hue * 6.0
+            x_val = c * (1.0 - abs(h_sector % 2.0 - 1.0))
+            m = lightness - c * 0.5
+            
+            # Determine RGB based on hue sector
+            sector = int(h_sector) % 6
+            
+            if sector == 0:
+                r, g, b = c, x_val, 0.0
+            elif sector == 1:
+                r, g, b = x_val, c, 0.0
+            elif sector == 2:
+                r, g, b = 0.0, c, x_val
+            elif sector == 3:
+                r, g, b = 0.0, x_val, c
+            elif sector == 4:
+                r, g, b = x_val, 0.0, c
+            else:
+                r, g, b = c, 0.0, x_val
+            
+            # Add m and convert to 0-255, clamping values
+            r_val = (r + m) * 255.0
+            g_val = (g + m) * 255.0
+            b_val = (b + m) * 255.0
+            
+            # Clamp to valid range
+            if r_val < 0.0:
+                r_val = 0.0
+            elif r_val > 255.0:
+                r_val = 255.0
+            if g_val < 0.0:
+                g_val = 0.0
+            elif g_val > 255.0:
+                g_val = 255.0
+            if b_val < 0.0:
+                b_val = 0.0
+            elif b_val > 255.0:
+                b_val = 255.0
+            
+            rgb[y, x, 0] = np.uint8(r_val)
+            rgb[y, x, 1] = np.uint8(g_val)
+            rgb[y, x, 2] = np.uint8(b_val)
+    
+    return rgb
+
+
 def colour_selector(iterations: np.ndarray, max_iterations: int,
-                   hue_shift: float = 0.0, saturation: float = 1.0,
-                   lightness: float = 0.5) -> np.ndarray:
-   """
-   Convert iteration counts to RGB with adjustable HSL parameters.
-   
-   Args:
-       iterations: 2D array of iteration counts.
-       max_iterations: Maximum iteration value.
-       hue_shift: Hue rotation in range [0, 1].
-       saturation: Saturation multiplier in range [0, 1].
-       lightness: Lightness adjustment in range [0, 1].
-       
-   Returns:
-       3D RGB array (height, width, 3).
-   """
-   height, width = iterations.shape
-   rgb = np.zeros((height, width, 3), dtype=np.uint8)
-   
-   # Mask for points in the set
-   in_set = iterations >= max_iterations - 1
-   
-   # Normalise iteration counts for points outside the set
-   normalised = np.zeros_like(iterations)
-   max_external = np.max(iterations[~in_set]) if np.any(~in_set) else 1.0
-   if max_external > 0:
-       normalised = iterations / max_external
-   
-   # Calculate hue with shift (wrapping around 0-1)
-   hue = (normalised + hue_shift) % 1.0
-   
-   # Create saturation and lightness arrays
-   sat = np.full_like(hue, saturation)
-   lit = np.full_like(hue, lightness)
-   
-   # HSL to RGB conversion
-   c = (1 - np.abs(2 * lit - 1)) * sat
-   x = c * (1 - np.abs((hue * 6) % 2 - 1))
-   m = lit - c / 2
-   
-   # Determine RGB based on hue sector
-   hue_sector = (hue * 6).astype(int) % 6
-   
-   r = np.zeros_like(hue)
-   g = np.zeros_like(hue)
-   b = np.zeros_like(hue)
-   
-   # Sector 0: R=C, G=X, B=0
-   mask = hue_sector == 0
-   r[mask], g[mask], b[mask] = c[mask], x[mask], 0
-   
-   # Sector 1: R=X, G=C, B=0
-   mask = hue_sector == 1
-   r[mask], g[mask], b[mask] = x[mask], c[mask], 0
-   
-   # Sector 2: R=0, G=C, B=X
-   mask = hue_sector == 2
-   r[mask], g[mask], b[mask] = 0, c[mask], x[mask]
-   
-   # Sector 3: R=0, G=X, B=C
-   mask = hue_sector == 3
-   r[mask], g[mask], b[mask] = 0, x[mask], c[mask]
-   
-   # Sector 4: R=X, G=0, B=C
-   mask = hue_sector == 4
-   r[mask], g[mask], b[mask] = x[mask], 0, c[mask]
-   
-   # Sector 5: R=C, G=0, B=X
-   mask = hue_sector == 5
-   r[mask], g[mask], b[mask] = c[mask], 0, x[mask]
-   
-   # Add m and convert to 0-255
-   rgb[:, :, 0] = np.clip((r + m) * 255, 0, 255).astype(np.uint8)
-   rgb[:, :, 1] = np.clip((g + m) * 255, 0, 255).astype(np.uint8)
-   rgb[:, :, 2] = np.clip((b + m) * 255, 0, 255).astype(np.uint8)
-   
-   # Points in the set are black
-   rgb[in_set] = [0, 0, 0]
-   
-   return rgb
+                    hue_shift: float = 0.0, saturation: float = 1.0,
+                    lightness: float = 0.5) -> np.ndarray:
+    """
+    Wrapper function that calls the Numba-optimised colour conversion.
+    
+    Maintains the same interface as the original function.
+    """
+    # Mask for points in the set
+    in_set = iterations >= max_iterations - 1
+    
+    # Calculate max_external for normalisation
+    if np.any(~in_set):
+        max_external = np.max(iterations[~in_set])
+    else:
+        max_external = 1.0
+    
+    if max_external <= 0:
+        max_external = 1.0
+    
+    return colour_selector_numba(
+        iterations, max_iterations,
+        hue_shift, saturation, lightness,
+        max_external
+    )
 
 
 class TileCache:
@@ -367,254 +399,162 @@ def get_adaptive_iterations(zoom_level: float, config: RenderConfig) -> int:
    return config.base_iterations + additional
 
 
-class ComputationDebouncer:
-    """Debounces rapid computation requests to prevent wasted work."""
-    
-    def __init__(self, delay_ms: int = 50):
-        self.delay_ms = delay_ms
-        self.last_request_time: float = 0
-        self.pending_request: Optional[ViewState] = None
-        self.timer: Optional[QTimer] = None
-    
-    def should_compute(self, view: ViewState, current_time: float) -> bool:
-        """Determine if enough time has passed to compute."""
-        time_since_last = current_time - self.last_request_time
-        return time_since_last >= (self.delay_ms / 1000.0)
-    
-    def record_computation(self, view: ViewState) -> None:
-        """Record that a computation was started."""
-        self.last_request_time = time.time()
-        self.pending_request = None
-
-
 class ComputeWorker(QThread):
-    """Worker thread with progressive rendering, caching, and color separation."""
-    
-    # Separate signals for computation and recoloring
-    computation_progress = pyqtSignal(np.ndarray, object, bool, object, int)
-    recolor_complete = pyqtSignal(np.ndarray)
-    
-    def __init__(self, config: RenderConfig):
-        super().__init__()
-        self.config = config
-        
-        # Thread synchronisation
-        self.mutex = QMutex()
-        self.condition = QWaitCondition()
-        
-        # Request state
-        self.pending_view: Optional[ViewState] = None
-        self.pending_recolor: bool = False
-        self.current_request_id: int = 0
-        self.should_stop = False
-        self.has_work = False
-        
-        # Enhanced tile cache - now stores iterations permanently
-        self.tile_cache = TileCache(config.max_cached_tiles)
-        
-        # Current iteration data (for instant recoloring)
-        self.current_iterations: Optional[np.ndarray] = None
-        self.current_max_iter: int = config.max_iterations
-        self.current_view: Optional[ViewState] = None
-        
-        # HSL colour parameters
-        self.hue_shift: float = 0.0
-        self.saturation: float = 1.0
-        self.lightness: float = 0.5
-        
-        # Debouncer for rapid zoom/pan operations
-        self.debouncer = ComputationDebouncer(delay_ms=50)
-        
-        # Warm up Numba JIT compilation
-        self._warmup_jit()
-    
-    def _warmup_jit(self) -> None:
-        """Pre-compile Numba functions to avoid delay on first zoom."""
-        _ = compute_mandelbrot_numba(-2.0, 1.0, -1.0, 1.0, 16, 16, 32)
-        _ = compute_mandelbrot_subsampled(-2.0, 1.0, -1.0, 1.0, 16, 16, 32, 4)
-        test_iter = np.zeros((4, 4), dtype=np.float64)
-        _ = upscale_nearest(test_iter, 2)
-    
-    def set_colour_params(self, hue: float, saturation: float, lightness: float) -> None:
-        """Update colour parameters and trigger recolor only."""
-        self.mutex.lock()
-        self.hue_shift = hue
-        self.saturation = saturation
-        self.lightness = lightness
-        self.pending_recolor = True
-        self.has_work = True
-        self.condition.wakeOne()
-        self.mutex.unlock()
-    
-    def request_computation(self, view: ViewState) -> None:
-        """Request computation for a new view."""
-        self.mutex.lock()
-        self.pending_view = view.copy()
-        self.current_request_id += 1
-        self.has_work = True
-        self.condition.wakeOne()
-        self.mutex.unlock()
-    
-    def stop(self) -> None:
-        """Signal worker to stop."""
-        self.mutex.lock()
-        self.should_stop = True
-        self.has_work = True
-        self.condition.wakeOne()
-        self.mutex.unlock()
-        self.wait()
-    
-    def _is_request_stale(self, request_id: int) -> bool:
-        """Check if a newer request has superseded this one."""
-        self.mutex.lock()
-        stale = request_id != self.current_request_id
-        self.mutex.unlock()
-        return stale
-    
-    def _handle_recolor_request(self) -> None:
-        """Handle a recolor-only request (no computation needed)."""
-        self.mutex.lock()
-        
-        if self.current_iterations is None:
-            self.pending_recolor = False
-            self.mutex.unlock()
-            return
-        
-        iterations = self.current_iterations.copy()
-        max_iter = self.current_max_iter
-        view = self.current_view.copy() if self.current_view else None
-        hue = self.hue_shift
-        sat = self.saturation
-        lit = self.lightness
-        self.pending_recolor = False
-        
-        self.mutex.unlock()
-        
-        # Recolor without locking
-        rgb = colour_selector(iterations, max_iter, hue, sat, lit)
-        
-        # Emit with full data so widget can update
-        if view:
-            self.computation_progress.emit(rgb, view, True, iterations, max_iter)
-    
-    def run(self) -> None:
-        """Main worker loop with progressive rendering and smart caching."""
-        while True:
-            self.mutex.lock()
-            while not self.has_work:
-                self.condition.wait(self.mutex)
-            
-            if self.should_stop:
-                self.mutex.unlock()
-                break
-            
-            # Check if this is just a recolor request
-            if self.pending_recolor and self.pending_view is None:
-                self.has_work = False
-                self.mutex.unlock()
-                self._handle_recolor_request()
-                continue
-            
-            # Handle computation request
-            view = self.pending_view
-            request_id = self.current_request_id
-            self.pending_view = None
-            self.has_work = False
-            self.mutex.unlock()
-            
-            if view is None:
-                continue
-            
-            # Debouncing - skip computation if requests are coming too fast
-            current_time = time.time()
-            if not self.debouncer.should_compute(view, current_time):
-                # Store as pending and wait
-                self.mutex.lock()
-                if self.pending_view is None:  # Don't override newer request
-                    self.pending_view = view
-                    self.has_work = True
-                self.mutex.unlock()
-                time.sleep(0.03)  # Small delay before retry
-                continue
-            
-            self.debouncer.record_computation(view)
-            
-            # Get adaptive iteration count
-            max_iter = get_adaptive_iterations(view.zoom_level, self.config)
-            
-            # Check cache for full resolution result
-            cached = self.tile_cache.get(
-                view.x_min, view.x_max, view.y_min, view.y_max,
-                self.config.width, self.config.height, max_iter
-            )
-            
-            if cached is not None:
-                # Cache hit - store and colorize
-                self.mutex.lock()
-                self.current_iterations = cached.copy()
-                self.current_max_iter = max_iter
-                self.current_view = view.copy()
-                hue = self.hue_shift
-                sat = self.saturation
-                lit = self.lightness
-                self.mutex.unlock()
-                
-                rgb = colour_selector(cached, max_iter, hue, sat, lit)
-                if not self._is_request_stale(request_id):
-                    self.computation_progress.emit(rgb, view, True, cached, max_iter)
-                continue
-            
-            # Progressive rendering passes
-            for subsample in self.config.progressive_passes:
-                if self._is_request_stale(request_id):
-                    break
-                
-                is_final = (subsample == 1)
-                
-                if subsample > 1:
-                    iterations = compute_mandelbrot_subsampled(
-                        view.x_min, view.x_max,
-                        view.y_min, view.y_max,
-                        self.config.width, self.config.height,
-                        max_iter, subsample
-                    )
-                    iterations_full = upscale_nearest(iterations, subsample)
-                else:
-                    iterations_full = compute_mandelbrot_numba(
-                        view.x_min, view.x_max,
-                        view.y_min, view.y_max,
-                        self.config.width, self.config.height,
-                        max_iter
-                    )
-                    
-                    # Cache the final iteration data
-                    self.tile_cache.put(
-                        view.x_min, view.x_max, view.y_min, view.y_max,
-                        self.config.width, self.config.height, max_iter,
-                        iterations_full
-                    )
-                    
-                    # Store current iterations for instant recoloring
-                    self.mutex.lock()
-                    self.current_iterations = iterations_full.copy()
-                    self.current_max_iter = max_iter
-                    self.current_view = view.copy()
-                    self.mutex.unlock()
-                
-                if self._is_request_stale(request_id):
-                    break
-                
-                # Colorize with current settings
-                self.mutex.lock()
-                hue = self.hue_shift
-                sat = self.saturation
-                lit = self.lightness
-                self.mutex.unlock()
-                
-                rgb = colour_selector(iterations_full, max_iter, hue, sat, lit)
-                
-                if not self._is_request_stale(request_id):
-                    self.computation_progress.emit(rgb, view, is_final, iterations_full, max_iter)
+   """Worker thread with progressive rendering and caching."""
+   
+   # Signal for each progressive pass (rgb_array, view_state, is_final, iterations, max_iter)
+   computation_progress = pyqtSignal(np.ndarray, object, bool, object, int)
+   
+   def __init__(self, config: RenderConfig):
+       super().__init__()
+       self.config = config
+       
+       # Thread synchronisation
+       self.mutex = QMutex()
+       self.condition = QWaitCondition()
+       
+       # Request state
+       self.pending_view: Optional[ViewState] = None
+       self.current_request_id: int = 0
+       self.should_stop = False
+       self.has_work = False
+       
+       # Tile cache
+       self.tile_cache = TileCache(config.max_cached_tiles)
+       
+       # HSL colour parameters
+       self.hue_shift: float = 0.0
+       self.saturation: float = 1.0
+       self.lightness: float = 0.5
+       
+       # Warm up Numba JIT compilation
+       self._warmup_jit()
+   
+   def _warmup_jit(self) -> None:
+       """Pre-compile Numba functions to avoid delay on first zoom."""
+       _ = compute_mandelbrot_numba(-2.0, 1.0, -1.0, 1.0, 16, 16, 32)
+       _ = compute_mandelbrot_subsampled(-2.0, 1.0, -1.0, 1.0, 16, 16, 32, 4)
+       test_iter = np.zeros((4, 4), dtype=np.float64)
+       _ = upscale_nearest(test_iter, 2)
+       _ = colour_selector_numba(test_iter, 32, 0.0, 1.0, 0.5, 1.0)
+   
+   def set_colour_params(self, hue: float, saturation: float, lightness: float) -> None:
+       """Update colour parameters."""
+       self.mutex.lock()
+       self.hue_shift = hue
+       self.saturation = saturation
+       self.lightness = lightness
+       self.mutex.unlock()
+   
+   def request_computation(self, view: ViewState) -> None:
+       """Request computation for a new view."""
+       self.mutex.lock()
+       self.pending_view = view.copy()
+       self.current_request_id += 1
+       self.has_work = True
+       self.condition.wakeOne()
+       self.mutex.unlock()
+   
+   def stop(self) -> None:
+       """Signal worker to stop."""
+       self.mutex.lock()
+       self.should_stop = True
+       self.has_work = True
+       self.condition.wakeOne()
+       self.mutex.unlock()
+       self.wait()
+   
+   def _is_request_stale(self, request_id: int) -> bool:
+       """Check if a newer request has superseded this one."""
+       self.mutex.lock()
+       stale = request_id != self.current_request_id
+       self.mutex.unlock()
+       return stale
+   
+   def run(self) -> None:
+       """Main worker loop with progressive rendering."""
+       while True:
+           self.mutex.lock()
+           while not self.has_work:
+               self.condition.wait(self.mutex)
+           
+           if self.should_stop:
+               self.mutex.unlock()
+               break
+           
+           view = self.pending_view
+           request_id = self.current_request_id
+           self.pending_view = None
+           self.has_work = False
+           self.mutex.unlock()
+           
+           if view is None:
+               continue
+           
+           # Get adaptive iteration count
+           max_iter = get_adaptive_iterations(view.zoom_level, self.config)
+           
+           # Check cache for full resolution result
+           cached = self.tile_cache.get(
+               view.x_min, view.x_max, view.y_min, view.y_max,
+               self.config.width, self.config.height, max_iter
+           )
+           
+           if cached is not None:
+               self.mutex.lock()
+               hue = self.hue_shift
+               sat = self.saturation
+               lit = self.lightness
+               self.mutex.unlock()
+               
+               rgb = colour_selector(cached, max_iter, hue, sat, lit)
+               if not self._is_request_stale(request_id):
+                   self.computation_progress.emit(rgb, view, True, cached, max_iter)
+               continue
+           
+           # Progressive rendering passes
+           for subsample in self.config.progressive_passes:
+               if self._is_request_stale(request_id):
+                   break
+               
+               is_final = (subsample == 1)
+               
+               if subsample > 1:
+                   iterations = compute_mandelbrot_subsampled(
+                       view.x_min, view.x_max,
+                       view.y_min, view.y_max,
+                       self.config.width, self.config.height,
+                       max_iter, subsample
+                   )
+                   iterations_full = upscale_nearest(iterations, subsample)
+               else:
+                   iterations_full = compute_mandelbrot_numba(
+                       view.x_min, view.x_max,
+                       view.y_min, view.y_max,
+                       self.config.width, self.config.height,
+                       max_iter
+                   )
+                   
+                   self.tile_cache.put(
+                       view.x_min, view.x_max, view.y_min, view.y_max,
+                       self.config.width, self.config.height, max_iter,
+                       iterations_full
+                   )
+               
+               if self._is_request_stale(request_id):
+                   break
+               
+               # Convert to RGB using colour_selector
+               self.mutex.lock()
+               hue = self.hue_shift
+               sat = self.saturation
+               lit = self.lightness
+               self.mutex.unlock()
+               
+               rgb = colour_selector(iterations_full, max_iter, hue, sat, lit)
+               
+               if not self._is_request_stale(request_id):
+                   self.computation_progress.emit(rgb, view, is_final, iterations_full, max_iter)
 
 
 class MandelbrotWidget(QLabel):
@@ -627,7 +567,7 @@ class MandelbrotWidget(QLabel):
         
         self.config = config
         self.view = ViewState()
-        
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # Mouse tracking state
         self.current_mouse_pos: Optional[QPointF] = None
         self.pan_start_pos: Optional[QPointF] = None
@@ -657,12 +597,6 @@ class MandelbrotWidget(QLabel):
         self.current_iterations: Optional[np.ndarray] = None
         self.current_max_iter: int = config.max_iterations
         
-        # Debounce timer for color changes
-        self.color_debounce_timer = QTimer()
-        self.color_debounce_timer.setSingleShot(True)
-        self.color_debounce_timer.timeout.connect(self._apply_color_change)
-        self.pending_color_params: Optional[Tuple[float, float, float]] = None
-        
         # Display initial loading state
         self._show_loading_state()
         
@@ -674,6 +608,72 @@ class MandelbrotWidget(QLabel):
         grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
         self._display_rgb_array(grey)
     
+    def keyboard_shortcuts(self, key: int) -> bool:
+        """
+        Handle keyboard navigation shortcuts.
+        
+        Args:
+            key: Qt key code
+            
+        Returns:
+            True if key was handled, False otherwise
+        """
+        # Don't process shortcuts while panning with mouse
+        if self.is_panning:
+            return False
+        
+        # Calculate pan distance (10% of current view)
+        pan_distance_x = self.view.current_width * 0.1
+        pan_distance_y = self.view.current_height * 0.1
+        
+        handled = True
+        
+        if key == Qt.Key.Key_W:
+            # Pan up (positive imaginary)
+            self.view.centre_imag += pan_distance_y
+            self.worker.request_computation(self.view)
+            
+        elif key == Qt.Key.Key_S:
+            # Pan down (negative imaginary)
+            self.view.centre_imag -= pan_distance_y
+            self.worker.request_computation(self.view)
+            
+        elif key == Qt.Key.Key_A:
+            # Pan left (negative real)
+            self.view.centre_real -= pan_distance_x
+            self.worker.request_computation(self.view)
+            
+        elif key == Qt.Key.Key_D:
+            # Pan right (positive real)
+            self.view.centre_real += pan_distance_x
+            self.worker.request_computation(self.view)
+            
+        elif key == Qt.Key.Key_Q:
+            # Zoom in at center
+            new_zoom = self.view.zoom_level * self.zoom_factor
+            
+            if new_zoom <= self.max_zoom:
+                self.view.zoom_level = new_zoom
+                self.worker.request_computation(self.view)
+            
+        elif key == Qt.Key.Key_E:
+            # Zoom out at center
+            new_zoom = self.view.zoom_level / self.zoom_factor
+            
+            if new_zoom >= 1.0:
+                self.view.zoom_level = new_zoom
+                self.worker.request_computation(self.view)
+            
+        elif key == Qt.Key.Key_R:
+            # Reset to initial view
+            self.view = ViewState()
+            self.worker.request_computation(self.view)
+            
+        else:
+            handled = False
+        
+        return handled
+
     def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
         """Convert numpy RGB array to QPixmap and display."""
         height, width, channels = rgb_array.shape
@@ -696,9 +696,9 @@ class MandelbrotWidget(QLabel):
         self.setPixmap(QPixmap.fromImage(qimage))
     
     def _on_computation_progress(self, rgb_array: np.ndarray,
-                                  view: ViewState, is_final: bool,
-                                  iterations: Optional[np.ndarray] = None,
-                                  max_iter: int = 256) -> None:
+                                    view: ViewState, is_final: bool,
+                                    iterations: Optional[np.ndarray] = None,
+                                    max_iter: int = 256) -> None:
         """Handle progressive rendering updates."""
         self._display_rgb_array(rgb_array)
         self.is_final_render = is_final
@@ -708,8 +708,10 @@ class MandelbrotWidget(QLabel):
         self.view_changed.emit(view, is_final)
     
     def update_colours(self, hue: float, saturation: float, lightness: float) -> None:
-        """Update colour parameters with instant local recoloring and debounced worker update."""
-        # Instant local recolor for immediate feedback
+        """Update colour parameters and recolour current image."""
+        self.worker.set_colour_params(hue, saturation, lightness)
+        
+        # If we have cached iteration data, recolour immediately
         if self.current_iterations is not None:
             rgb = colour_selector(
                 self.current_iterations,
@@ -717,17 +719,6 @@ class MandelbrotWidget(QLabel):
                 hue, saturation, lightness
             )
             self._display_rgb_array(rgb)
-        
-        # Debounce worker update (for when we need to recolor cached data)
-        self.pending_color_params = (hue, saturation, lightness)
-        self.color_debounce_timer.start(100)  # Wait 100ms for more changes
-    
-    def _apply_color_change(self) -> None:
-        """Apply debounced color change to worker."""
-        if self.pending_color_params:
-            hue, sat, lit = self.pending_color_params
-            self.worker.set_colour_params(hue, sat, lit)
-            self.pending_color_params = None
     
     def mousePressEvent(self, event: QMouseEvent) -> None:
         """Handle mouse press to initiate panning."""
@@ -825,10 +816,16 @@ class MandelbrotWidget(QLabel):
     def get_current_view(self) -> ViewState:
         """Return a copy of the current view state."""
         return self.view.copy()
-    
+
+    def keyPressEvent(self, event) -> None:
+        """Handle key press events for navigation shortcuts."""
+        if self.keyboard_shortcuts(event.key()):
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
     def cleanup(self) -> None:
         """Stop the worker thread."""
-        self.color_debounce_timer.stop()
         self.worker.stop()
 
 
@@ -912,254 +909,260 @@ class ImageSaver:
 
 
 class MandelbrotWindow(QMainWindow):
-   """Main application window with save functionality."""
-   
-   def __init__(self):
-       super().__init__()
-       
-       self.setWindowTitle("Mandelbrot Set Viewer")
-       
-       # Create render configuration
-       self.config = RenderConfig(
-           width=800,
-           height=600,
-           max_iterations=256
-       )
-       
-       # Create central widget
-       central_widget = QWidget()
-       self.setCentralWidget(central_widget)
-       
-       # Create layout
-       layout = QVBoxLayout(central_widget)
-       layout.setContentsMargins(0, 0, 0, 0)
-       layout.setSpacing(0)
-       
-       # Create Mandelbrot display widget
-       self.mandelbrot_widget = MandelbrotWidget(self.config)
-       layout.addWidget(self.mandelbrot_widget)
-       
-       # Create status bar
-       self.status_label = QLabel()
-       self.status_label.setStyleSheet(
-           "padding: 8px; "
-           "background-color: #2d2d2d; "
-           "color: #e0e0e0; "
-           "font-family: monospace; "
-           "font-size: 11px;"
-       )
-       self._update_status()
-       layout.addWidget(self.status_label)
-       
-       # Create colour control sliders
-       colour_group = QGroupBox("Colour Controls")
-       colour_group.setStyleSheet("""
-           QGroupBox {
-               color: #e0e0e0;
-               border: 1px solid #404040;
-               margin-top: 10px;
-               padding-top: 10px;
-           }
-           QGroupBox::title {
-               subcontrol-origin: margin;
-               left: 10px;
-               padding: 0 5px;
-           }
-       """)
-       colour_layout = QVBoxLayout(colour_group)
-       
-       # Hue slider
-       hue_layout = QHBoxLayout()
-       hue_label = QLabel("Hue:")
-       hue_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
-       self.hue_slider = QSlider(Qt.Orientation.Horizontal)
-       self.hue_slider.setRange(0, 100)
-       self.hue_slider.setValue(0)
-       self.hue_slider.setStyleSheet(self._slider_style())
-       self.hue_value_label = QLabel("0%")
-       self.hue_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
-       hue_layout.addWidget(hue_label)
-       hue_layout.addWidget(self.hue_slider)
-       hue_layout.addWidget(self.hue_value_label)
-       colour_layout.addLayout(hue_layout)
-       
-       # Saturation slider
-       sat_layout = QHBoxLayout()
-       sat_label = QLabel("Saturation:")
-       sat_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
-       self.sat_slider = QSlider(Qt.Orientation.Horizontal)
-       self.sat_slider.setRange(0, 100)
-       self.sat_slider.setValue(100)
-       self.sat_slider.setStyleSheet(self._slider_style())
-       self.sat_value_label = QLabel("100%")
-       self.sat_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
-       sat_layout.addWidget(sat_label)
-       sat_layout.addWidget(self.sat_slider)
-       sat_layout.addWidget(self.sat_value_label)
-       colour_layout.addLayout(sat_layout)
-       
-       # Lightness slider
-       lit_layout = QHBoxLayout()
-       lit_label = QLabel("Lightness:")
-       lit_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
-       self.lit_slider = QSlider(Qt.Orientation.Horizontal)
-       self.lit_slider.setRange(0, 100)
-       self.lit_slider.setValue(50)
-       self.lit_slider.setStyleSheet(self._slider_style())
-       self.lit_value_label = QLabel("50%")
-       self.lit_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
-       lit_layout.addWidget(lit_label)
-       lit_layout.addWidget(self.lit_slider)
-       lit_layout.addWidget(self.lit_value_label)
-       colour_layout.addLayout(lit_layout)
-       
-       layout.addWidget(colour_group)
-       
-       # Create instructions label
-       self.instructions_label = QLabel(
-           "Scroll: Zoom  |  Drag: Pan  |  Ctrl+S: Save Image"
-       )
-       self.instructions_label.setStyleSheet(
-           "padding: 5px; "
-           "background-color: #1a1a1a; "
-           "color: #888888; "
-           "font-size: 10px;"
-       )
-       self.instructions_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-       layout.addWidget(self.instructions_label)
-       
-       # Connect signals
-       self.mandelbrot_widget.view_changed.connect(self._on_view_changed)
-       self.hue_slider.valueChanged.connect(self._on_colour_changed)
-       self.sat_slider.valueChanged.connect(self._on_colour_changed)
-       self.lit_slider.valueChanged.connect(self._on_colour_changed)
-       
-       # Size window to fit contents
-       self.adjustSize()
-       self.setMinimumSize(self.sizeHint())
-   
-   def _slider_style(self) -> str:
-       """Return stylesheet for sliders."""
-       return """
-           QSlider::groove:horizontal {
-               border: 1px solid #404040;
-               height: 8px;
-               background: #2d2d2d;
-               margin: 2px 0;
-               border-radius: 4px;
-           }
-           QSlider::handle:horizontal {
-               background: #606060;
-               border: 1px solid #808080;
-               width: 18px;
-               margin: -5px 0;
-               border-radius: 9px;
-           }
-           QSlider::handle:horizontal:hover {
-               background: #707070;
-           }
-           QSlider::sub-page:horizontal {
-               background: #4a90d9;
-               border-radius: 4px;
-           }
-       """
-   
-   def _on_colour_changed(self) -> None:
-       """Handle colour slider changes."""
-       hue = self.hue_slider.value() / 100.0
-       saturation = self.sat_slider.value() / 100.0
-       lightness = self.lit_slider.value() / 100.0
-       
-       # Update labels
-       self.hue_value_label.setText(f"{self.hue_slider.value()}%")
-       self.sat_value_label.setText(f"{self.sat_slider.value()}%")
-       self.lit_value_label.setText(f"{self.lit_slider.value()}%")
-       
-       # Update colours
-       self.mandelbrot_widget.update_colours(hue, saturation, lightness)
-   
-   def _update_status(self) -> None:
-       """Update the status label with current view information."""
-       view = self.mandelbrot_widget.view
-       
-       # Check if at precision limit
-       at_limit = view.zoom_level >= self.mandelbrot_widget.max_zoom * 0.99
-       limit_warning = "  ⚠ PRECISION LIMIT" if at_limit else ""
-       
-       # Render quality indicator
-       quality = "●" if self.mandelbrot_widget.is_final_render else "○"
-       
-       self.status_label.setText(
-           f"{quality} Centre: ({view.centre_real:.10g}, {view.centre_imag:.10g})  │  "
-           f"Zoom: {view.zoom_level:.4e}x{limit_warning}"
-       )
-   
-   def _on_view_changed(self, view: ViewState, is_final: bool) -> None:
-       """Called when the view has been updated."""
-       self._update_status()
-   
-   def keyPressEvent(self, event) -> None:
-       """Handle keyboard shortcuts."""
-       if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-           if event.key() == Qt.Key.Key_S:
-               self._save_image()
-               return
-       
-       super().keyPressEvent(event)
-   
-   def _save_image(self) -> None:
-       """Open save dialog and save current view."""
-       rgb_data = self.mandelbrot_widget.get_current_image()
-       
-       if rgb_data is None:
-           QMessageBox.warning(
-               self,
-               "Cannot Save",
-               "No image data available to save."
-           )
-           return
-       
-       view = self.mandelbrot_widget.get_current_view()
-       suggested_name = ImageSaver.generate_filename(view)
-       
-       filepath, _ = QFileDialog.getSaveFileName(
-           self,
-           "Save Mandelbrot Image",
-           suggested_name,
-           "PNG Images (*.png);;All Files (*)"
-       )
-       
-       if not filepath:
-           return
-       
-       if not filepath.lower().endswith('.png'):
-           filepath += '.png'
-       
-       success = ImageSaver.save_image(
-           rgb_data,
-           view,
-           Path(filepath),
-           embed_text=True
-       )
-       
-       if success:
-           QMessageBox.information(
-               self,
-               "Image Saved",
-               f"Image saved successfully to:\n{filepath}\n\n"
-               f"Coordinates embedded in image metadata."
-           )
-       else:
-           QMessageBox.critical(
-               self,
-               "Save Failed",
-               "Failed to save the image. Please try again."
-           )
-   
-   def closeEvent(self, event) -> None:
-       """Clean up worker thread on close."""
-       self.mandelbrot_widget.cleanup()
-       super().closeEvent(event)
+    """Main application window with save functionality."""
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.setWindowTitle("Mandelbrot Set Viewer")
+        
+        # Create render configuration
+        self.config = RenderConfig(
+            width=800,
+            height=600,
+            max_iterations=256
+        )
+        
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Create layout
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Create Mandelbrot display widget
+        self.mandelbrot_widget = MandelbrotWidget(self.config)
+        layout.addWidget(self.mandelbrot_widget)
+        
+        # Create status bar
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            "padding: 8px; "
+            "background-color: #2d2d2d; "
+            "color: #e0e0e0; "
+            "font-family: monospace; "
+            "font-size: 11px;"
+        )
+        self._update_status()
+        layout.addWidget(self.status_label)
+        
+        # Create colour control sliders
+        colour_group = QGroupBox("Colour Controls")
+        colour_group.setStyleSheet("""
+            QGroupBox {
+                color: #e0e0e0;
+                border: 1px solid #404040;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        colour_layout = QVBoxLayout(colour_group)
+        
+        # Hue slider
+        hue_layout = QHBoxLayout()
+        hue_label = QLabel("Hue:")
+        hue_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.hue_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hue_slider.setRange(0, 100)
+        self.hue_slider.setValue(0)
+        self.hue_slider.setStyleSheet(self._slider_style())
+        self.hue_value_label = QLabel("0%")
+        self.hue_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        hue_layout.addWidget(hue_label)
+        hue_layout.addWidget(self.hue_slider)
+        hue_layout.addWidget(self.hue_value_label)
+        colour_layout.addLayout(hue_layout)
+        
+        # Saturation slider
+        sat_layout = QHBoxLayout()
+        sat_label = QLabel("Saturation:")
+        sat_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.sat_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sat_slider.setRange(0, 100)
+        self.sat_slider.setValue(100)
+        self.sat_slider.setStyleSheet(self._slider_style())
+        self.sat_value_label = QLabel("100%")
+        self.sat_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        sat_layout.addWidget(sat_label)
+        sat_layout.addWidget(self.sat_slider)
+        sat_layout.addWidget(self.sat_value_label)
+        colour_layout.addLayout(sat_layout)
+        
+        # Lightness slider
+        lit_layout = QHBoxLayout()
+        lit_label = QLabel("Lightness:")
+        lit_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.lit_slider = QSlider(Qt.Orientation.Horizontal)
+        self.lit_slider.setRange(0, 100)
+        self.lit_slider.setValue(50)
+        self.lit_slider.setStyleSheet(self._slider_style())
+        self.lit_value_label = QLabel("50%")
+        self.lit_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        lit_layout.addWidget(lit_label)
+        lit_layout.addWidget(self.lit_slider)
+        lit_layout.addWidget(self.lit_value_label)
+        colour_layout.addLayout(lit_layout)
+        
+        layout.addWidget(colour_group)
+        
+        # Create instructions label
+        self.instructions_label = QLabel(
+            "Scroll: Zoom  |  Drag: Pan  |  Ctrl+S: Save Image"
+        )
+        self.instructions_label.setStyleSheet(
+            "padding: 5px; "
+            "background-color: #1a1a1a; "
+            "color: #888888; "
+            "font-size: 10px;"
+        )
+        self.instructions_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.instructions_label)
+        
+        # Connect signals
+        self.mandelbrot_widget.view_changed.connect(self._on_view_changed)
+        self.hue_slider.valueChanged.connect(self._on_colour_changed)
+        self.sat_slider.valueChanged.connect(self._on_colour_changed)
+        self.lit_slider.valueChanged.connect(self._on_colour_changed)
+        
+        # Size window to fit contents
+        self.adjustSize()
+        self.setMinimumSize(self.sizeHint())
+    
+    def _slider_style(self) -> str:
+        """Return stylesheet for sliders."""
+        return """
+            QSlider::groove:horizontal {
+                border: 1px solid #404040;
+                height: 8px;
+                background: #2d2d2d;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #606060;
+                border: 1px solid #808080;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #707070;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4a90d9;
+                border-radius: 4px;
+            }
+        """
+    
+    def _on_colour_changed(self) -> None:
+        """Handle colour slider changes."""
+        hue = self.hue_slider.value() / 100.0
+        saturation = self.sat_slider.value() / 100.0
+        lightness = self.lit_slider.value() / 100.0
+        
+        # Update labels
+        self.hue_value_label.setText(f"{self.hue_slider.value()}%")
+        self.sat_value_label.setText(f"{self.sat_slider.value()}%")
+        self.lit_value_label.setText(f"{self.lit_slider.value()}%")
+        
+        # Update colours
+        self.mandelbrot_widget.update_colours(hue, saturation, lightness)
+    
+    def _update_status(self) -> None:
+        """Update the status label with current view information."""
+        view = self.mandelbrot_widget.view
+        
+        # Check if at precision limit
+        at_limit = view.zoom_level >= self.mandelbrot_widget.max_zoom * 0.99
+        limit_warning = "  ⚠ PRECISION LIMIT" if at_limit else ""
+        
+        # Render quality indicator
+        quality = "●" if self.mandelbrot_widget.is_final_render else "○"
+        
+        self.status_label.setText(
+            f"{quality} Centre: ({view.centre_real:.10g}, {view.centre_imag:.10g})  │  "
+            f"Zoom: {view.zoom_level:.4e}x{limit_warning}"
+        )
+    
+    def _on_view_changed(self, view: ViewState, is_final: bool) -> None:
+        """Called when the view has been updated."""
+        self._update_status()
+    
+    def keyPressEvent(self, event) -> None:
+        """Handle keyboard shortcuts."""
+        # Check for Ctrl+S save shortcut
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_S:
+                self._save_image()
+                event.accept()
+                return
+        
+        # Forward navigation shortcuts to widget
+        if self.mandelbrot_widget.keyboard_shortcuts(event.key()):
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+    
+    def _save_image(self) -> None:
+        """Open save dialog and save current view."""
+        rgb_data = self.mandelbrot_widget.get_current_image()
+        
+        if rgb_data is None:
+            QMessageBox.warning(
+                self,
+                "Cannot Save",
+                "No image data available to save."
+            )
+            return
+        
+        view = self.mandelbrot_widget.get_current_view()
+        suggested_name = ImageSaver.generate_filename(view)
+        
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Mandelbrot Image",
+            suggested_name,
+            "PNG Images (*.png);;All Files (*)"
+        )
+        
+        if not filepath:
+            return
+        
+        if not filepath.lower().endswith('.png'):
+            filepath += '.png'
+        
+        success = ImageSaver.save_image(
+            rgb_data,
+            view,
+            Path(filepath),
+            embed_text=True
+        )
+        
+        if success:
+            QMessageBox.information(
+                self,
+                "Image Saved",
+                f"Image saved successfully to:\n{filepath}\n\n"
+                f"Coordinates embedded in image metadata."
+            )
+        else:
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                "Failed to save the image. Please try again."
+            )
+    
+    def closeEvent(self, event) -> None:
+        """Clean up worker thread on close."""
+        self.mandelbrot_widget.cleanup()
+        super().closeEvent(event)
 
 
 def main():
