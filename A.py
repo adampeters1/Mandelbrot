@@ -4,18 +4,44 @@ Interactive Mandelbrot Set Viewer
 A PyQt6-based interactive viewer with threaded computation, scroll-wheel zooming
 centred on mouse position, and precision limit detection.
 """
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
-import math
+from PyQt6.QtWidgets import (
+    QMainWindow, QLabel, QVBoxLayout, QWidget, 
+    QFileDialog, QMessageBox
+)
+from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtGui import QMouseEvent, QWheelEvent, QImage, QPixmap
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+import sys
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
 from datetime import datetime
-import os
+from pathlib import Path
+import hashlib
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
-                             QWidget, QFileDialog, QMessageBox)
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QLabel, QVBoxLayout, 
+    QWidget, QFileDialog, QMessageBox
+)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition
-from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QWheelEvent, QPainter, QPen, QColor
+from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QWheelEvent
+
+from PIL import Image, ImageDraw, ImageFont
+
+from numba import jit, prange
+from numba import config
+
+
+
+import math
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition
@@ -36,25 +62,22 @@ from numba import config
 # Enable parallel processing in Numba
 config.THREADING_LAYER = 'threadsafe'
 
-@dataclass
+@dataclass 
 class ViewState:
     """Represents the current view into the complex plane."""
     centre_real: float = -0.5
     centre_imag: float = 0.0
-    zoom_level: float = 1.0  # 1.0 = initial view showing full set
+    zoom_level: float = 1.0
     
-    # Initial view bounds (at zoom_level = 1.0)
-    initial_width: float = 3.5   # Real axis span
-    initial_height: float = 2.5  # Imaginary axis span
+    initial_width: float = 3.5
+    initial_height: float = 2.5
     
     @property
     def current_width(self) -> float:
-        """Current width in complex plane units."""
         return self.initial_width / self.zoom_level
     
     @property
     def current_height(self) -> float:
-        """Current height in complex plane units."""
         return self.initial_height / self.zoom_level
     
     @property
@@ -73,7 +96,7 @@ class ViewState:
     def y_max(self) -> float:
         return self.centre_imag + self.current_height / 2
     
-    def pixel_to_complex(self, pixel_x: int, pixel_y: int, 
+    def pixel_to_complex(self, pixel_x: int, pixel_y: int,
                          image_width: int, image_height: int) -> tuple[float, float]:
         """Convert pixel coordinates to complex plane coordinates."""
         real = self.x_min + (pixel_x / image_width) * self.current_width
@@ -88,6 +111,16 @@ class ViewState:
             zoom_level=self.zoom_level,
             initial_width=self.initial_width,
             initial_height=self.initial_height
+        )
+    
+    def to_metadata_string(self) -> str:
+        """Generate a metadata string for embedding in saved images."""
+        return (
+            f"Mandelbrot Set\n"
+            f"Centre: {self.centre_real:.15g} + {self.centre_imag:.15g}i\n"
+            f"Zoom: {self.zoom_level:.6e}x\n"
+            f"Region: [{self.x_min:.15g}, {self.x_max:.15g}] x "
+            f"[{self.y_min:.15g}, {self.y_max:.15g}]"
         )
 
 
@@ -698,53 +731,53 @@ class ComputeWorker(QThread):
 
 class MandelbrotWidget(QLabel):
     """
-    Enhanced widget with pan support and visual feedback.
-    
-    Implements click-drag panning and displays pan state visually.
+    Widget displaying the Mandelbrot set with scroll-wheel zoom and click-drag pan.
     """
     
-    # Signal emitted when view changes (for status updates)
-    view_changed = pyqtSignal(object)  # ViewState
+    # Signal to notify parent of view changes
+    view_changed = pyqtSignal(object, bool)  # (view_state, is_final_render)
     
-    def __init__(self, config: RenderConfig, parent=None):
+    def __init__(self, config: 'RenderConfig', parent=None):
         super().__init__(parent)
         
         self.config = config
         self.view = ViewState()
-        self.current_mouse_pos = None
+        
+        # Mouse tracking state
+        self.current_mouse_pos: Optional[QPointF] = None
+        self.pan_start_pos: Optional[QPointF] = None
+        self.pan_start_view: Optional[ViewState] = None
+        self.is_panning = False
         
         # Zoom settings
         self.zoom_factor = 1.5
         
-        # Pan state
-        self.is_panning = False
-        self.pan_start_pos: Optional[QPointF] = None
-        self.pan_start_view: Optional[ViewState] = None
-        
-        # Calculate maximum zoom
+        # Calculate maximum zoom based on float64 precision
         initial_pixel_spacing = self.view.initial_width / self.config.width
         self.max_zoom = initial_pixel_spacing / self.config.min_pixel_spacing
         
+        # Set up the widget
         self.setFixedSize(config.width, config.height)
         self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
         
-        # Create enhanced worker
+        # Create and start the compute worker
         self.worker = ComputeWorker(config)
-        # FIXED: Connect to the correct signal name
         self.worker.computation_progress.connect(self._on_computation_progress)
         self.worker.start()
         
-        self._show_loading_state()
-        self.worker.request_computation(self.view)
-        
-        # Track render quality
+        # Track render state
         self.is_final_render = False
+        self.current_rgb_data: Optional[np.ndarray] = None
         
-        # Store current display for saving
-        self.current_rgb_array: Optional[np.ndarray] = None
+        # Display initial loading state
+        self._show_loading_state()
+        
+        # Request initial computation
+        self.worker.request_computation(self.view)
     
     def _show_loading_state(self) -> None:
-        """Display placeholder while computing."""
+        """Display a placeholder while computing."""
         grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
         self._display_rgb_array(grey)
     
@@ -765,60 +798,20 @@ class MandelbrotWidget(QLabel):
         
         # Keep reference to prevent garbage collection
         self._current_image_data = rgb_contiguous
+        self.current_rgb_data = rgb_contiguous.copy()
         
-        pixmap = QPixmap.fromImage(qimage)
-        
-        # If panning, draw overlay to show pan state
-        if self.is_panning and self.pan_start_pos and self.current_mouse_pos:
-            pixmap = self._draw_pan_overlay(pixmap)
-        
-        self.setPixmap(pixmap)
+        self.setPixmap(QPixmap.fromImage(qimage))
     
-    def _draw_pan_overlay(self, pixmap: QPixmap) -> QPixmap:
-        """Draw visual feedback during panning."""
-        # Create a copy to draw on
-        overlay_pixmap = QPixmap(pixmap)
-        painter = QPainter(overlay_pixmap)
-        
-        # Semi-transparent overlay
-        painter.setOpacity(0.3)
-        painter.fillRect(overlay_pixmap.rect(), QColor(100, 150, 200))
-        
-        # Draw arrow from start to current position
-        painter.setOpacity(1.0)
-        pen = QPen(QColor(255, 255, 255), 2, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        
-        start_x = int(self.pan_start_pos.x())
-        start_y = int(self.pan_start_pos.y())
-        curr_x = int(self.current_mouse_pos.x())
-        curr_y = int(self.current_mouse_pos.y())
-        
-        painter.drawLine(start_x, start_y, curr_x, curr_y)
-        
-        # Draw circles at start and end
-        painter.setBrush(QColor(255, 255, 255))
-        painter.drawEllipse(start_x - 5, start_y - 5, 10, 10)
-        painter.setBrush(QColor(200, 200, 255))
-        painter.drawEllipse(curr_x - 5, curr_y - 5, 10, 10)
-        
-        painter.end()
-        return overlay_pixmap
-    
-    def _on_computation_progress(self, rgb_array: np.ndarray, 
+    def _on_computation_progress(self, rgb_array: np.ndarray,
                                   view: ViewState, is_final: bool) -> None:
         """Handle progressive rendering updates."""
-        self.current_rgb_array = rgb_array.copy()
         self._display_rgb_array(rgb_array)
         self.is_final_render = is_final
-        
-        # Emit view changed signal for status updates
-        self.view_changed.emit(view)
+        self.view_changed.emit(view, is_final)
     
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        """Handle mouse press for pan initiation."""
+        """Handle mouse press to initiate panning."""
         if event.button() == Qt.MouseButton.LeftButton:
-            # Start panning
             self.is_panning = True
             self.pan_start_pos = event.position()
             self.pan_start_view = self.view.copy()
@@ -827,56 +820,56 @@ class MandelbrotWidget(QLabel):
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """Track mouse position and handle panning."""
+        """Handle mouse movement for tracking and panning."""
         self.current_mouse_pos = event.position()
         
-        if self.is_panning and self.pan_start_pos and self.pan_start_view:
-            # Calculate pan offset in pixels
-            dx_pixels = event.position().x() - self.pan_start_pos.x()
-            dy_pixels = event.position().y() - self.pan_start_pos.y()
+        if self.is_panning and self.pan_start_pos is not None and self.pan_start_view is not None:
+            # Calculate pixel displacement
+            delta_x = event.position().x() - self.pan_start_pos.x()
+            delta_y = event.position().y() - self.pan_start_pos.y()
             
-            # Convert pixel offset to complex plane offset
-            pixel_to_complex_x = self.pan_start_view.current_width / self.config.width
-            pixel_to_complex_y = self.pan_start_view.current_height / self.config.height
+            # Convert pixel displacement to complex plane displacement
+            # Note: y-axis is inverted (up in pixels = positive imaginary)
+            complex_delta_x = -delta_x * (self.pan_start_view.current_width / self.config.width)
+            complex_delta_y = delta_y * (self.pan_start_view.current_height / self.config.height)
             
-            dx_complex = -dx_pixels * pixel_to_complex_x  # Negative for natural pan direction
-            dy_complex = dy_pixels * pixel_to_complex_y   # Positive because y increases downward
+            # Update view centre
+            self.view.centre_real = self.pan_start_view.centre_real + complex_delta_x
+            self.view.centre_imag = self.pan_start_view.centre_imag + complex_delta_y
             
-            # Update view center
-            self.view.centre_real = self.pan_start_view.centre_real + dx_complex
-            self.view.centre_imag = self.pan_start_view.centre_imag + dy_complex
-            
-            # Visual feedback - redraw with overlay
-            if self.current_rgb_array is not None:
-                self._display_rgb_array(self.current_rgb_array)
+            # Request recomputation
+            self.worker.request_computation(self.view)
         
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        """Handle mouse release to complete pan."""
-        if event.button() == Qt.MouseButton.LeftButton and self.is_panning:
+        """Handle mouse release to end panning."""
+        if event.button() == Qt.MouseButton.LeftButton:
             self.is_panning = False
             self.pan_start_pos = None
             self.pan_start_view = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            
-            # Trigger recomputation at the new position
-            self.worker.request_computation(self.view)
+            self.setCursor(Qt.CursorShape.CrossCursor)
         
         super().mouseReleaseEvent(event)
     
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Handle scroll wheel zoom."""
+        """Handle scroll wheel for zooming."""
+        # Don't zoom while panning
+        if self.is_panning:
+            return
+        
         delta = event.angleDelta().y()
         
         if delta == 0:
             return
         
+        # Determine zoom direction
         if delta > 0:
             new_zoom = self.view.zoom_level * self.zoom_factor
         else:
             new_zoom = self.view.zoom_level / self.zoom_factor
         
+        # Enforce zoom limits
         if new_zoom < 1.0:
             new_zoom = 1.0
         elif new_zoom > self.max_zoom:
@@ -884,79 +877,171 @@ class MandelbrotWidget(QLabel):
             if self.view.zoom_level >= self.max_zoom:
                 return
         
+        # Get zoom centre point (mouse position)
         pos = event.position()
         zoom_x = pos.x()
         zoom_y = pos.y()
         
+        # Convert pixel position to complex coordinates (before zoom)
         complex_x, complex_y = self.view.pixel_to_complex(
             int(zoom_x), int(zoom_y),
             self.config.width, self.config.height
         )
         
+        # Calculate relative position of mouse in view (0 to 1)
         rel_x = zoom_x / self.config.width
         rel_y = zoom_y / self.config.height
         
+        # Update zoom level
         self.view.zoom_level = new_zoom
         
+        # Adjust centre so point under mouse stays fixed
         new_width = self.view.current_width
         new_height = self.view.current_height
         
         self.view.centre_real = complex_x - (rel_x - 0.5) * new_width
         self.view.centre_imag = complex_y + (rel_y - 0.5) * new_height
         
+        # Request new computation
         self.worker.request_computation(self.view)
     
-    def save_current_view(self, filepath: str) -> bool:
+    def get_current_image(self) -> Optional[np.ndarray]:
+        """Return the current RGB image data."""
+        return self.current_rgb_data
+    
+    def get_current_view(self) -> ViewState:
+        """Return a copy of the current view state."""
+        return self.view.copy()
+    
+    def cleanup(self) -> None:
+        """Stop the worker thread."""
+        self.worker.stop()
+
+
+class ImageSaver:
+    """
+    Handles saving Mandelbrot images with embedded metadata.
+    """
+    
+    @staticmethod
+    def save_image(rgb_data: np.ndarray, view: ViewState, 
+                   filepath: Path, embed_text: bool = True) -> bool:
         """
-        Save the current view to an image file with metadata.
+        Save the current view as a PNG image with metadata.
         
         Args:
-            filepath: Path to save the image.
+            rgb_data: RGB image array.
+            view: Current view state for metadata.
+            filepath: Destination file path.
+            embed_text: Whether to embed coordinate text on the image.
             
         Returns:
             True if save was successful, False otherwise.
         """
-        if self.current_rgb_array is None:
-            return False
-        
         try:
-            from PIL import Image
-            from PIL.PngImagePlugin import PngInfo
-            
             # Create PIL Image from numpy array
-            img = Image.fromarray(self.current_rgb_array, mode='RGB')
+            image = Image.fromarray(rgb_data, mode='RGB')
             
-            # Create metadata
-            metadata = PngInfo()
-            metadata.add_text("Mandelbrot-Centre-Real", f"{self.view.centre_real:.17g}")
-            metadata.add_text("Mandelbrot-Centre-Imag", f"{self.view.centre_imag:.17g}")
-            metadata.add_text("Mandelbrot-Zoom", f"{self.view.zoom_level:.17g}")
-            metadata.add_text("Mandelbrot-Bounds", 
-                            f"{self.view.x_min:.17g},{self.view.x_max:.17g},"
-                            f"{self.view.y_min:.17g},{self.view.y_max:.17g}")
-            metadata.add_text("Mandelbrot-Resolution", 
-                            f"{self.config.width}x{self.config.height}")
-            metadata.add_text("Mandelbrot-MaxIterations", 
-                            f"{get_adaptive_iterations(self.view.zoom_level, self.config)}")
-            metadata.add_text("Mandelbrot-Timestamp", 
-                            datetime.now().isoformat())
+            if embed_text:
+                image = ImageSaver._add_metadata_overlay(image, view)
+            
+            # Add PNG metadata
+            from PIL import PngImagePlugin
+            metadata = PngImagePlugin.PngInfo()
+            metadata.add_text("Mandelbrot_Centre_Real", f"{view.centre_real:.15g}")
+            metadata.add_text("Mandelbrot_Centre_Imag", f"{view.centre_imag:.15g}")
+            metadata.add_text("Mandelbrot_Zoom", f"{view.zoom_level:.15g}")
+            metadata.add_text("Mandelbrot_X_Min", f"{view.x_min:.15g}")
+            metadata.add_text("Mandelbrot_X_Max", f"{view.x_max:.15g}")
+            metadata.add_text("Mandelbrot_Y_Min", f"{view.y_min:.15g}")
+            metadata.add_text("Mandelbrot_Y_Max", f"{view.y_max:.15g}")
+            metadata.add_text("Generated", datetime.now().isoformat())
             
             # Save with metadata
-            img.save(filepath, "PNG", pnginfo=metadata)
+            image.save(filepath, "PNG", pnginfo=metadata)
+            
             return True
             
         except Exception as e:
             print(f"Error saving image: {e}")
             return False
     
-    def cleanup(self) -> None:
-        """Stop worker thread."""
-        self.worker.stop()
+    @staticmethod
+    def _add_metadata_overlay(image: Image.Image, view: ViewState) -> Image.Image:
+        """
+        Add a semi-transparent overlay with coordinate information.
+        
+        Args:
+            image: PIL Image to modify.
+            view: View state containing coordinates.
+            
+        Returns:
+            Modified image with overlay.
+        """
+        # Create a copy to avoid modifying original
+        image = image.copy()
+        draw = ImageDraw.Draw(image, 'RGBA')
+        
+        # Prepare text
+        text_lines = [
+            f"Centre: {view.centre_real:.10g} + {view.centre_imag:.10g}i",
+            f"Zoom: {view.zoom_level:.4e}x"
+        ]
+        text = "\n".join(text_lines)
+        
+        # Calculate text size and position
+        # Use default font (more reliable across systems)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+        except OSError:
+            try:
+                font = ImageFont.truetype("C:/Windows/Fonts/consola.ttf", 12)
+            except OSError:
+                font = ImageFont.load_default()
+        
+        # Get text bounding box
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        # Position in bottom-left corner with padding
+        padding = 10
+        x = padding
+        y = image.height - text_height - padding - 10
+        
+        # Draw semi-transparent background
+        bg_rect = [
+            x - 5,
+            y - 5,
+            x + text_width + 10,
+            y + text_height + 10
+        ]
+        draw.rectangle(bg_rect, fill=(0, 0, 0, 180))
+        
+        # Draw text
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
+        
+        return image
+    
+    @staticmethod
+    def generate_filename(view: ViewState) -> str:
+        """
+        Generate a descriptive filename based on view parameters.
+        
+        Args:
+            view: Current view state.
+            
+        Returns:
+            Suggested filename string.
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zoom_str = f"{view.zoom_level:.2e}".replace("+", "").replace(".", "p")
+        return f"mandelbrot_{timestamp}_zoom{zoom_str}.png"
 
 
 class MandelbrotWindow(QMainWindow):
     """
-    Enhanced main window with save functionality and improved status display.
+    Main application window with save functionality.
     """
     
     def __init__(self):
@@ -968,9 +1053,7 @@ class MandelbrotWindow(QMainWindow):
         self.config = RenderConfig(
             width=800,
             height=600,
-            base_iterations=256,
-            progressive_passes=(8, 4, 2, 1),
-            max_cached_tiles=256
+            max_iterations=256
         )
         
         # Create central widget
@@ -980,56 +1063,42 @@ class MandelbrotWindow(QMainWindow):
         # Create layout
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         
         # Create Mandelbrot display widget
         self.mandelbrot_widget = MandelbrotWidget(self.config)
         layout.addWidget(self.mandelbrot_widget)
         
-        # Create status label with improved styling
+        # Create status bar for information display
         self.status_label = QLabel()
         self.status_label.setStyleSheet(
             "padding: 8px; "
-            "background-color: #2b2b2b; "
+            "background-color: #2d2d2d; "
             "color: #e0e0e0; "
-            "font-family: 'Courier New', monospace; "
-            "font-size: 10pt;"
+            "font-family: monospace; "
+            "font-size: 11px;"
         )
         self._update_status()
         layout.addWidget(self.status_label)
         
-        # Create help label
-        self.help_label = QLabel()
-        self.help_label.setStyleSheet(
-            "padding: 6px; "
+        # Create instructions label
+        self.instructions_label = QLabel(
+            "Scroll: Zoom  |  Drag: Pan  |  Ctrl+S: Save Image"
+        )
+        self.instructions_label.setStyleSheet(
+            "padding: 5px; "
             "background-color: #1a1a1a; "
-            "color: #a0a0a0; "
-            "font-size: 9pt;"
+            "color: #888888; "
+            "font-size: 10px;"
         )
-        self.help_label.setText(
-            "🖱️ Scroll: Zoom  |  🖱️ Click+Drag: Pan  |  Ctrl+S: Save Image"
-        )
-        layout.addWidget(self.help_label)
+        self.instructions_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.instructions_label)
         
-        # Connect to track view changes
+        # Connect signals
         self.mandelbrot_widget.view_changed.connect(self._on_view_changed)
-        
-        # Set up keyboard shortcuts
-        self._setup_shortcuts()
         
         # Size window to fit contents
         self.setFixedSize(self.sizeHint())
-    
-    def _setup_shortcuts(self) -> None:
-        """Set up keyboard shortcuts."""
-        from PyQt6.QtGui import QKeySequence, QShortcut
-        
-        # Ctrl+S to save
-        save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
-        save_shortcut.activated.connect(self._save_image)
-        
-        # Ctrl+Shift+S to quick save
-        quick_save_shortcut = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
-        quick_save_shortcut.activated.connect(self._quick_save_image)
     
     def _update_status(self) -> None:
         """Update the status label with current view information."""
@@ -1037,88 +1106,83 @@ class MandelbrotWindow(QMainWindow):
         
         # Check if at precision limit
         at_limit = view.zoom_level >= self.mandelbrot_widget.max_zoom * 0.99
-        limit_warning = " ⚠️ PRECISION LIMIT" if at_limit else ""
-        
-        # Get adaptive iteration count
-        max_iter = get_adaptive_iterations(view.zoom_level, self.config)
+        limit_warning = "  ⚠ PRECISION LIMIT" if at_limit else ""
         
         # Render quality indicator
-        quality = "FINAL" if self.mandelbrot_widget.is_final_render else "PREVIEW"
-        quality_color = "#00ff00" if self.mandelbrot_widget.is_final_render else "#ffaa00"
+        quality = "●" if self.mandelbrot_widget.is_final_render else "○"
         
         self.status_label.setText(
-            f"<span style='color: {quality_color};'>●</span> {quality}  |  "
-            f"Centre: <b>({view.centre_real:.10g}, {view.centre_imag:.10g})</b>  |  "
-            f"Zoom: <b>{view.zoom_level:.2e}x</b>  |  "
-            f"Iterations: <b>{max_iter}</b>"
-            f"<span style='color: #ff4444;'>{limit_warning}</span>"
+            f"{quality} Centre: ({view.centre_real:.10g}, {view.centre_imag:.10g})  │  "
+            f"Zoom: {view.zoom_level:.4e}x{limit_warning}"
         )
     
-    def _on_view_changed(self, view: ViewState) -> None:
-        """Called when view has been updated."""
+    def _on_view_changed(self, view: ViewState, is_final: bool) -> None:
+        """Called when the view has been updated."""
         self._update_status()
     
-    def _save_image(self) -> None:
-        """Show save dialog and save current view."""
-        # Generate default filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zoom_str = f"zoom{self.mandelbrot_widget.view.zoom_level:.1e}".replace('+', '')
-        default_name = f"mandelbrot_{timestamp}_{zoom_str}.png"
+    def keyPressEvent(self, event) -> None:
+        """Handle keyboard shortcuts."""
+        # Ctrl+S to save
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_S:
+                self._save_image()
+                return
         
-        # Show file dialog
+        super().keyPressEvent(event)
+    
+    def _save_image(self) -> None:
+        """Open save dialog and save current view."""
+        # Get current image data
+        rgb_data = self.mandelbrot_widget.get_current_image()
+        
+        if rgb_data is None:
+            QMessageBox.warning(
+                self,
+                "Cannot Save",
+                "No image data available to save."
+            )
+            return
+        
+        # Generate suggested filename
+        view = self.mandelbrot_widget.get_current_view()
+        suggested_name = ImageSaver.generate_filename(view)
+        
+        # Open save dialog
         filepath, _ = QFileDialog.getSaveFileName(
             self,
             "Save Mandelbrot Image",
-            default_name,
+            suggested_name,
             "PNG Images (*.png);;All Files (*)"
         )
         
-        if filepath:
-            # Ensure .png extension
-            if not filepath.lower().endswith('.png'):
-                filepath += '.png'
-            
-            # Save the image
-            success = self.mandelbrot_widget.save_current_view(filepath)
-            
-            if success:
-                QMessageBox.information(
-                    self,
-                    "Save Successful",
-                    f"Image saved to:\n{filepath}\n\n"
-                    f"Metadata includes coordinates and zoom level."
-                )
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Save Failed",
-                    "Failed to save image. Please try again."
-                )
-    
-    def _quick_save_image(self) -> None:
-        """Quick save without dialog to default location."""
-        # Create saves directory if it doesn't exist
-        save_dir = "mandelbrot_saves"
-        os.makedirs(save_dir, exist_ok=True)
+        if not filepath:
+            return  # User cancelled
         
-        # Generate filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zoom_str = f"zoom{self.mandelbrot_widget.view.zoom_level:.1e}".replace('+', '')
-        filename = f"mandelbrot_{timestamp}_{zoom_str}.png"
-        filepath = os.path.join(save_dir, filename)
+        # Ensure .png extension
+        if not filepath.lower().endswith('.png'):
+            filepath += '.png'
         
-        # Save
-        success = self.mandelbrot_widget.save_current_view(filepath)
+        # Save the image
+        success = ImageSaver.save_image(
+            rgb_data,
+            view,
+            Path(filepath),
+            embed_text=True
+        )
         
         if success:
-            # Show brief notification in status
-            original_text = self.status_label.text()
-            self.status_label.setText(
-                f"<span style='color: #00ff00;'>✓ Saved to {filepath}</span>"
+            QMessageBox.information(
+                self,
+                "Image Saved",
+                f"Image saved successfully to:\n{filepath}\n\n"
+                f"Coordinates embedded in image metadata."
             )
-            # Restore original status after 3 seconds
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(3000, lambda: self.status_label.setText(original_text))
+        else:
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                "Failed to save the image. Please try again."
+            )
     
     def closeEvent(self, event) -> None:
         """Clean up worker thread on close."""
@@ -1128,28 +1192,38 @@ class MandelbrotWindow(QMainWindow):
 
 def main():
     """Application entry point."""
-    import sys
-    
     app = QApplication(sys.argv)
+    
+    # Set application style
     app.setStyle('Fusion')
     
-    # Set dark palette
-    from PyQt6.QtGui import QPalette, QColor
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(25, 25, 25))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
-    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(35, 35, 35))
-    app.setPalette(palette)
+    # Apply dark theme
+    app.setStyleSheet("""
+        QMainWindow {
+            background-color: #1a1a1a;
+        }
+        QMessageBox {
+            background-color: #2d2d2d;
+            color: #e0e0e0;
+        }
+        QMessageBox QLabel {
+            color: #e0e0e0;
+        }
+        QMessageBox QPushButton {
+            background-color: #404040;
+            color: #e0e0e0;
+            border: 1px solid #555555;
+            padding: 5px 15px;
+            min-width: 60px;
+        }
+        QMessageBox QPushButton:hover {
+            background-color: #505050;
+        }
+        QFileDialog {
+            background-color: #2d2d2d;
+            color: #e0e0e0;
+        }
+    """)
     
     window = MandelbrotWindow()
     window.show()
