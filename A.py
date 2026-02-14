@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from PyQt6.QtWidgets import QSlider, QHBoxLayout, QGroupBox
+
 from PyQt6.QtWidgets import (
     QMainWindow, QLabel, QVBoxLayout, QWidget, 
     QFileDialog, QMessageBox
@@ -583,6 +585,88 @@ def iterations_to_rgb(iterations: np.ndarray, max_iterations: int) -> np.ndarray
     return rgb
 
 
+def colour_selector(iterations: np.ndarray, max_iterations: int,
+                    hue_shift: float = 0.0, saturation: float = 1.0,
+                    lightness: float = 0.5) -> np.ndarray:
+    """
+    Convert iteration counts to RGB with adjustable HSL parameters.
+    
+    Args:
+        iterations: 2D array of iteration counts.
+        max_iterations: Maximum iteration value.
+        hue_shift: Hue rotation in range [0, 1].
+        saturation: Saturation multiplier in range [0, 1].
+        lightness: Lightness adjustment in range [0, 1].
+        
+    Returns:
+        3D RGB array (height, width, 3).
+    """
+    height, width = iterations.shape
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    # Mask for points in the set
+    in_set = iterations >= max_iterations - 1
+    
+    # Normalise iteration counts for points outside the set
+    normalised = np.zeros_like(iterations)
+    max_external = np.max(iterations[~in_set]) if np.any(~in_set) else 1.0
+    if max_external > 0:
+        normalised = iterations / max_external
+    
+    # Calculate hue with shift (wrapping around 0-1)
+    hue = (normalised + hue_shift) % 1.0
+    
+    # Create saturation and lightness arrays
+    sat = np.full_like(hue, saturation)
+    lit = np.full_like(hue, lightness)
+    
+    # HSL to RGB conversion
+    c = (1 - np.abs(2 * lit - 1)) * sat
+    x = c * (1 - np.abs((hue * 6) % 2 - 1))
+    m = lit - c / 2
+    
+    # Determine RGB based on hue sector
+    hue_sector = (hue * 6).astype(int) % 6
+    
+    r = np.zeros_like(hue)
+    g = np.zeros_like(hue)
+    b = np.zeros_like(hue)
+    
+    # Sector 0: R=C, G=X, B=0
+    mask = hue_sector == 0
+    r[mask], g[mask], b[mask] = c[mask], x[mask], 0
+    
+    # Sector 1: R=X, G=C, B=0
+    mask = hue_sector == 1
+    r[mask], g[mask], b[mask] = x[mask], c[mask], 0
+    
+    # Sector 2: R=0, G=C, B=X
+    mask = hue_sector == 2
+    r[mask], g[mask], b[mask] = 0, c[mask], x[mask]
+    
+    # Sector 3: R=0, G=X, B=C
+    mask = hue_sector == 3
+    r[mask], g[mask], b[mask] = 0, x[mask], c[mask]
+    
+    # Sector 4: R=X, G=0, B=C
+    mask = hue_sector == 4
+    r[mask], g[mask], b[mask] = x[mask], 0, c[mask]
+    
+    # Sector 5: R=C, G=0, B=X
+    mask = hue_sector == 5
+    r[mask], g[mask], b[mask] = c[mask], 0, x[mask]
+    
+    # Add m and convert to 0-255
+    rgb[:, :, 0] = np.clip((r + m) * 255, 0, 255).astype(np.uint8)
+    rgb[:, :, 1] = np.clip((g + m) * 255, 0, 255).astype(np.uint8)
+    rgb[:, :, 2] = np.clip((b + m) * 255, 0, 255).astype(np.uint8)
+    
+    # Points in the set are black
+    rgb[in_set] = [0, 0, 0]
+    
+    return rgb
+
+
 class ComputeWorker(QThread):
     """
     Enhanced worker thread with progressive rendering and caching.
@@ -592,7 +676,7 @@ class ComputeWorker(QThread):
     """
     
     # Signal for each progressive pass (rgb_array, view_state, is_final)
-    computation_progress = pyqtSignal(np.ndarray, object, bool)
+    computation_progress = pyqtSignal(np.ndarray, object, bool, object, int)
     
     def __init__(self, config: RenderConfig):
         super().__init__()
@@ -611,9 +695,22 @@ class ComputeWorker(QThread):
         # Tile cache
         self.tile_cache = TileCache(config.max_cached_tiles)
         
+        # HSL colour parameters
+        self.hue_shift: float = 0.0
+        self.saturation: float = 1.0
+        self.lightness: float = 0.5
+        
         # Warm up Numba JIT compilation on first run
         self._warmup_jit()
     
+    def set_colour_params(self, hue: float, saturation: float, lightness: float) -> None:
+        """Update colour parameters and trigger recolour."""
+        self.mutex.lock()
+        self.hue_shift = hue
+        self.saturation = saturation
+        self.lightness = lightness
+        self.mutex.unlock()
+
     def _warmup_jit(self) -> None:
         """Pre-compile Numba functions to avoid delay on first zoom."""
         # Small test computation to trigger JIT compilation
@@ -703,6 +800,14 @@ class ComputeWorker(QThread):
                     
                     # Upscale to full resolution
                     iterations_full = upscale_nearest(iterations, subsample)
+                    # Convert to RGB using colour_selector instead of iterations_to_rgb_numba
+                    self.mutex.lock()
+                    hue = self.hue_shift
+                    sat = self.saturation
+                    lit = self.lightness
+                    self.mutex.unlock()
+
+                    rgb = colour_selector(iterations_full, max_iter, hue, sat, lit)
                 else:
                     # Full resolution computation
                     iterations_full = compute_mandelbrot_numba(
@@ -723,10 +828,16 @@ class ComputeWorker(QThread):
                     break
                 
                 # Convert to RGB and emit
-                rgb = iterations_to_rgb_numba(iterations_full, max_iter)
+                self.mutex.lock()
+                hue = self.hue_shift
+                sat = self.saturation
+                lit = self.lightness
+                self.mutex.unlock()
+
+                rgb = colour_selector(iterations_full, max_iter, hue, sat, lit)
                 
                 if not self._is_request_stale(request_id):
-                    self.computation_progress.emit(rgb, view, is_final)
+                    self.computation_progress.emit(rgb, view, is_final, iterations_full, max_iter)
 
 
 class MandelbrotWidget(QLabel):
@@ -769,7 +880,10 @@ class MandelbrotWidget(QLabel):
         # Track render state
         self.is_final_render = False
         self.current_rgb_data: Optional[np.ndarray] = None
-        
+        # Store current iteration data for recolouring
+        self.current_iterations: Optional[np.ndarray] = None
+        self.current_max_iter: int = config.max_iterations
+
         # Display initial loading state
         self._show_loading_state()
         
@@ -781,6 +895,19 @@ class MandelbrotWidget(QLabel):
         grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
         self._display_rgb_array(grey)
     
+    def update_colours(self, hue: float, saturation: float, lightness: float) -> None:
+        """Update colour parameters and recolour current image."""
+        self.worker.set_colour_params(hue, saturation, lightness)
+        
+        # If we have cached iteration data, recolour immediately
+        if self.current_iterations is not None:
+            rgb = colour_selector(
+                self.current_iterations,
+                self.current_max_iter,
+                hue, saturation, lightness
+            )
+            self._display_rgb_array(rgb)
+
     def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
         """Convert numpy RGB array to QPixmap and display."""
         height, width, channels = rgb_array.shape
@@ -803,10 +930,15 @@ class MandelbrotWidget(QLabel):
         self.setPixmap(QPixmap.fromImage(qimage))
     
     def _on_computation_progress(self, rgb_array: np.ndarray,
-                                  view: ViewState, is_final: bool) -> None:
+                                view: ViewState, is_final: bool,
+                                iterations: Optional[np.ndarray] = None,
+                                max_iter: int = 256) -> None:
         """Handle progressive rendering updates."""
         self._display_rgb_array(rgb_array)
         self.is_final_render = is_final
+        if iterations is not None:
+            self.current_iterations = iterations.copy()
+            self.current_max_iter = max_iter
         self.view_changed.emit(view, is_final)
     
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -1097,9 +1229,119 @@ class MandelbrotWindow(QMainWindow):
         # Connect signals
         self.mandelbrot_widget.view_changed.connect(self._on_view_changed)
         
+        # Create colour control sliders
+        colour_group = QGroupBox("Colour Controls")
+        colour_group.setStyleSheet("""
+            QGroupBox {
+                color: #e0e0e0;
+                border: 1px solid #404040;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        colour_layout = QVBoxLayout(colour_group)
+
+        # Hue slider
+        hue_layout = QHBoxLayout()
+        hue_label = QLabel("Hue:")
+        hue_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.hue_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hue_slider.setRange(0, 100)
+        self.hue_slider.setValue(0)
+        self.hue_slider.setStyleSheet(self._slider_style())
+        self.hue_value_label = QLabel("0%")
+        self.hue_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        hue_layout.addWidget(hue_label)
+        hue_layout.addWidget(self.hue_slider)
+        hue_layout.addWidget(self.hue_value_label)
+        colour_layout.addLayout(hue_layout)
+
+        # Saturation slider
+        sat_layout = QHBoxLayout()
+        sat_label = QLabel("Saturation:")
+        sat_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.sat_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sat_slider.setRange(0, 100)
+        self.sat_slider.setValue(100)
+        self.sat_slider.setStyleSheet(self._slider_style())
+        self.sat_value_label = QLabel("100%")
+        self.sat_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        sat_layout.addWidget(sat_label)
+        sat_layout.addWidget(self.sat_slider)
+        sat_layout.addWidget(self.sat_value_label)
+        colour_layout.addLayout(sat_layout)
+
+        # Lightness slider
+        lit_layout = QHBoxLayout()
+        lit_label = QLabel("Lightness:")
+        lit_label.setStyleSheet("color: #e0e0e0; min-width: 70px;")
+        self.lit_slider = QSlider(Qt.Orientation.Horizontal)
+        self.lit_slider.setRange(0, 100)
+        self.lit_slider.setValue(50)
+        self.lit_slider.setStyleSheet(self._slider_style())
+        self.lit_value_label = QLabel("50%")
+        self.lit_value_label.setStyleSheet("color: #e0e0e0; min-width: 40px;")
+        lit_layout.addWidget(lit_label)
+        lit_layout.addWidget(self.lit_slider)
+        lit_layout.addWidget(self.lit_value_label)
+        colour_layout.addLayout(lit_layout)
+
+        layout.addWidget(colour_group)
+
+        # Connect slider signals
+        self.hue_slider.valueChanged.connect(self._on_colour_changed)
+        self.sat_slider.valueChanged.connect(self._on_colour_changed)
+        self.lit_slider.valueChanged.connect(self._on_colour_changed)
+
         # Size window to fit contents
-        self.setFixedSize(self.sizeHint())
+        self.adjustSize()
+        self.setMinimumSize(self.sizeHint())
     
+    def _slider_style(self) -> str:
+        """Return stylesheet for sliders."""
+        return """
+            QSlider::groove:horizontal {
+                border: 1px solid #404040;
+                height: 8px;
+                background: #2d2d2d;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #606060;
+                border: 1px solid #808080;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #707070;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4a90d9;
+                border-radius: 4px;
+            }
+        """
+
+    def _on_colour_changed(self) -> None:
+        """Handle colour slider changes."""
+        hue = self.hue_slider.value() / 100.0
+        saturation = self.sat_slider.value() / 100.0
+        lightness = self.lit_slider.value() / 100.0
+        
+        # Update labels
+        self.hue_value_label.setText(f"{self.hue_slider.value()}%")
+        self.sat_value_label.setText(f"{self.sat_slider.value()}%")
+        self.lit_value_label.setText(f"{self.lit_slider.value()}%")
+        
+        # Update colours
+        self.mandelbrot_widget.update_colours(hue, saturation, lightness)
+
     def _update_status(self) -> None:
         """Update the status label with current view information."""
         view = self.mandelbrot_widget.view

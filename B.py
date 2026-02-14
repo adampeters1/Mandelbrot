@@ -9,6 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from PyQt6.QtWidgets import QSlider, QHBoxLayout
+from PyQt6.QtCore import Qt
+
 from PyQt6.QtWidgets import (
     QMainWindow, QLabel, QVBoxLayout, QWidget, 
     QFileDialog, QMessageBox
@@ -311,13 +314,19 @@ def upscale_nearest(small: np.ndarray, factor: int) -> np.ndarray:
 
 @jit(nopython=True, parallel=True, cache=True)
 def iterations_to_rgb_numba(iterations: np.ndarray, 
-                             max_iterations: int) -> np.ndarray:
+                             max_iterations: int,
+                             hue_shift: float = 0.0,
+                             saturation: float = 1.0,
+                             lightness: float = 0.5) -> np.ndarray:
     """
-    Numba-optimised conversion of iteration counts to RGB.
+    Numba-optimised conversion of iteration counts to RGB with HSL control.
     
     Args:
         iterations: 2D array of iteration counts.
         max_iterations: Maximum iteration value.
+        hue_shift: Hue rotation in degrees (0-360).
+        saturation: Saturation level (0-1).
+        lightness: Lightness level (0-1).
         
     Returns:
         3D RGB array (height, width, 3).
@@ -336,6 +345,9 @@ def iterations_to_rgb_numba(iterations: np.ndarray,
     if max_external <= 0:
         max_external = 1.0
     
+    # Convert hue shift to radians
+    hue_shift_rad = (hue_shift / 360.0) * 2.0 * np.pi
+    
     # Convert to RGB in parallel
     for y in prange(height):
         for x in range(width):
@@ -347,12 +359,37 @@ def iterations_to_rgb_numba(iterations: np.ndarray,
                 rgb[y, x, 1] = 0
                 rgb[y, x, 2] = 0
             else:
-                # Normalise and apply colour mapping
-                t = (val / max_external) * 3.0 * np.pi
+                # Normalise and apply colour mapping with HSL
+                t = (val / max_external) * 3.0 * np.pi + hue_shift_rad
                 
-                rgb[y, x, 0] = np.uint8(127.5 * (1.0 + np.sin(t)))
-                rgb[y, x, 1] = np.uint8(127.5 * (1.0 + np.sin(t + 2.094)))
-                rgb[y, x, 2] = np.uint8(127.5 * (1.0 + np.sin(t + 4.189)))
+                # Generate base colour with sine waves
+                base_r = 0.5 * (1.0 + np.sin(t))
+                base_g = 0.5 * (1.0 + np.sin(t + 2.094))
+                base_b = 0.5 * (1.0 + np.sin(t + 4.189))
+                
+                # Apply saturation (blend with gray)
+                gray = 0.5
+                r = gray + (base_r - gray) * saturation
+                g = gray + (base_g - gray) * saturation
+                b = gray + (base_b - gray) * saturation
+                
+                # Apply lightness
+                if lightness < 0.5:
+                    # Darken
+                    factor = lightness * 2.0
+                    r *= factor
+                    g *= factor
+                    b *= factor
+                else:
+                    # Lighten
+                    factor = (lightness - 0.5) * 2.0
+                    r = r + (1.0 - r) * factor
+                    g = g + (1.0 - g) * factor
+                    b = b + (1.0 - b) * factor
+                
+                rgb[y, x, 0] = np.uint8(np.clip(r * 255, 0, 255))
+                rgb[y, x, 1] = np.uint8(np.clip(g * 255, 0, 255))
+                rgb[y, x, 2] = np.uint8(np.clip(b * 255, 0, 255))
     
     return rgb
 
@@ -543,44 +580,175 @@ def compute_mandelbrot_vectorised(view: ViewState, config: RenderConfig) -> np.n
     return iterations
 
 
-def iterations_to_rgb(iterations: np.ndarray, max_iterations: int) -> np.ndarray:
+def iterations_to_rgb(iterations: np.ndarray, max_iterations: int,
+                      hue_shift: float = 0.0, saturation: float = 1.0,
+                      lightness: float = 0.5) -> np.ndarray:
     """
-    Convert iteration counts to RGB image array.
-    
-    Uses sinusoidal colour mapping for smooth, aesthetically pleasing gradients.
+    Convert iteration counts to RGB image array with HSL control.
+    """
+    # This function now just calls the numba version
+    return iterations_to_rgb_numba(iterations, max_iterations, 
+                                   hue_shift, saturation, lightness)
+
+
+def colour_selector(parent_layout):
+    """
+    Create HSL colour sliders for customizing the Mandelbrot set colours.
     
     Args:
-        iterations: 2D array of normalised iteration counts.
-        max_iterations: Maximum iteration value.
+        parent_layout: The layout to add the sliders to.
         
     Returns:
-        3D array of shape (height, width, 3) with RGB values.
+        Tuple of (hue_slider, saturation_slider, lightness_slider)
     """
-    height, width = iterations.shape
-    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    # Hue slider (0-360 degrees)
+    hue_layout = QHBoxLayout()
+    hue_label = QLabel("Hue:")
+    hue_label.setStyleSheet("color: #e0e0e0; font-size: 10px; min-width: 80px;")
+    hue_slider = QSlider(Qt.Orientation.Horizontal)
+    hue_slider.setMinimum(0)
+    hue_slider.setMaximum(360)
+    hue_slider.setValue(0)
+    hue_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+    hue_slider.setTickInterval(60)
+    hue_slider.setStyleSheet("""
+        QSlider::groove:horizontal {
+            border: 1px solid #555555;
+            height: 8px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #ff0000, stop:0.17 #ffff00, stop:0.33 #00ff00,
+                stop:0.5 #00ffff, stop:0.67 #0000ff, stop:0.83 #ff00ff, stop:1 #ff0000);
+            margin: 2px 0;
+        }
+        QSlider::handle:horizontal {
+            background: #e0e0e0;
+            border: 1px solid #555555;
+            width: 18px;
+            margin: -5px 0;
+            border-radius: 3px;
+        }
+    """)
+    hue_value_label = QLabel("0°")
+    hue_value_label.setStyleSheet("color: #e0e0e0; font-size: 10px; min-width: 40px;")
+    hue_layout.addWidget(hue_label)
+    hue_layout.addWidget(hue_slider)
+    hue_layout.addWidget(hue_value_label)
     
-    # Mask for points in the set
-    in_set = iterations >= max_iterations - 1
+    # Saturation slider (0-100%)
+    sat_layout = QHBoxLayout()
+    sat_label = QLabel("Saturation:")
+    sat_label.setStyleSheet("color: #e0e0e0; font-size: 10px; min-width: 80px;")
+    sat_slider = QSlider(Qt.Orientation.Horizontal)
+    sat_slider.setMinimum(0)
+    sat_slider.setMaximum(100)
+    sat_slider.setValue(100)
+    sat_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+    sat_slider.setTickInterval(20)
+    sat_slider.setStyleSheet("""
+        QSlider::groove:horizontal {
+            border: 1px solid #555555;
+            height: 8px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #808080, stop:1 #ff0000);
+            margin: 2px 0;
+        }
+        QSlider::handle:horizontal {
+            background: #e0e0e0;
+            border: 1px solid #555555;
+            width: 18px;
+            margin: -5px 0;
+            border-radius: 3px;
+        }
+    """)
+    sat_value_label = QLabel("100%")
+    sat_value_label.setStyleSheet("color: #e0e0e0; font-size: 10px; min-width: 40px;")
+    sat_layout.addWidget(sat_label)
+    sat_layout.addWidget(sat_slider)
+    sat_layout.addWidget(sat_value_label)
     
-    # Normalise iteration counts for points outside the set
-    normalised = np.zeros_like(iterations)
-    if np.any(~in_set):
-        max_iter_external = np.max(iterations[~in_set])
-        if max_iter_external > 0:
-            normalised = iterations / max_iter_external
+    # Lightness slider (0-100%)
+    light_layout = QHBoxLayout()
+    light_label = QLabel("Lightness:")
+    light_label.setStyleSheet("color: #e0e0e0; font-size: 10px; min-width: 80px;")
+    light_slider = QSlider(Qt.Orientation.Horizontal)
+    light_slider.setMinimum(0)
+    light_slider.setMaximum(100)
+    light_slider.setValue(50)
+    light_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+    light_slider.setTickInterval(20)
+    light_slider.setStyleSheet("""
+        QSlider::groove:horizontal {
+            border: 1px solid #555555;
+            height: 8px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #000000, stop:0.5 #ff0000, stop:1 #ffffff);
+            margin: 2px 0;
+        }
+        QSlider::handle:horizontal {
+            background: #e0e0e0;
+            border: 1px solid #555555;
+            width: 18px;
+            margin: -5px 0;
+            border-radius: 3px;
+        }
+    """)
+    light_value_label = QLabel("50%")
+    light_value_label.setStyleSheet("color: #e0e0e0; font-size: 10px; min-width: 40px;")
+    light_layout.addWidget(light_label)
+    light_layout.addWidget(light_slider)
+    light_layout.addWidget(light_value_label)
     
-    # Apply smooth colouring using sine waves
-    # This creates a continuous colour cycle without banding
-    t = normalised * 3.0 * np.pi
+    # Add all layouts to parent
+    parent_layout.addLayout(hue_layout)
+    parent_layout.addLayout(sat_layout)
+    parent_layout.addLayout(light_layout)
     
-    rgb[:, :, 0] = (127.5 * (1 + np.sin(t))).astype(np.uint8)
-    rgb[:, :, 1] = (127.5 * (1 + np.sin(t + 2.094))).astype(np.uint8)  # +2π/3
-    rgb[:, :, 2] = (127.5 * (1 + np.sin(t + 4.189))).astype(np.uint8)  # +4π/3
+    # Connect sliders to update their value labels
+    hue_slider.valueChanged.connect(lambda v: hue_value_label.setText(f"{v}°"))
+    sat_slider.valueChanged.connect(lambda v: sat_value_label.setText(f"{v}%"))
+    light_slider.valueChanged.connect(lambda v: light_value_label.setText(f"{v}%"))
     
-    # Points in the set are black
-    rgb[in_set] = [0, 0, 0]
+    return hue_slider, sat_slider, light_slider
+
+
+def hsl_to_rgb(h: float, s: float, l: float) -> Tuple[float, float, float]:
+    """
+    Convert HSL color values to RGB.
     
-    return rgb
+    Args:
+        h: Hue (0-360)
+        s: Saturation (0-1)
+        l: Lightness (0-1)
+        
+    Returns:
+        Tuple of (r, g, b) values (0-1)
+    """
+    h = h / 360.0
+    
+    if s == 0:
+        return l, l, l
+    
+    def hue_to_rgb(p, q, t):
+        if t < 0:
+            t += 1
+        if t > 1:
+            t -= 1
+        if t < 1/6:
+            return p + (q - p) * 6 * t
+        if t < 1/2:
+            return q
+        if t < 2/3:
+            return p + (q - p) * (2/3 - t) * 6
+        return p
+    
+    q = l * (1 + s) if l < 0.5 else l + s - l * s
+    p = 2 * l - q
+    
+    r = hue_to_rgb(p, q, h + 1/3)
+    g = hue_to_rgb(p, q, h)
+    b = hue_to_rgb(p, q, h - 1/3)
+    
+    return r, g, b
 
 
 class ComputeWorker(QThread):
@@ -610,7 +778,12 @@ class ComputeWorker(QThread):
         
         # Tile cache
         self.tile_cache = TileCache(config.max_cached_tiles)
-        
+
+        # Colour settings
+        self.hue_shift = 0.0
+        self.saturation = 1.0
+        self.lightness = 0.5
+
         # Warm up Numba JIT compilation on first run
         self._warmup_jit()
     
@@ -620,9 +793,17 @@ class ComputeWorker(QThread):
         _ = compute_mandelbrot_numba(-2.0, 1.0, -1.0, 1.0, 16, 16, 32)
         _ = compute_mandelbrot_subsampled(-2.0, 1.0, -1.0, 1.0, 16, 16, 32, 4)
         test_iter = np.zeros((4, 4), dtype=np.float64)
-        _ = iterations_to_rgb_numba(test_iter, 32)
+        _ = iterations_to_rgb_numba(test_iter, 32, 0.0, 1.0, 0.5)
         _ = upscale_nearest(test_iter, 2)
     
+    def update_colour_settings(self, hue: float, saturation: float, lightness: float) -> None:
+        """Update the colour settings for rendering."""
+        self.mutex.lock()
+        self.hue_shift = hue
+        self.saturation = saturation
+        self.lightness = lightness
+        self.mutex.unlock()
+
     def request_computation(self, view: 'ViewState') -> None:
         """Request computation for a new view, cancelling any pending work."""
         self.mutex.lock()
@@ -723,7 +904,8 @@ class ComputeWorker(QThread):
                     break
                 
                 # Convert to RGB and emit
-                rgb = iterations_to_rgb_numba(iterations_full, max_iter)
+                rgb = iterations_to_rgb_numba(iterations_full, max_iter, 
+                                             self.hue_shift, self.saturation, self.lightness)
                 
                 if not self._is_request_stale(request_id):
                     self.computation_progress.emit(rgb, view, is_final)
@@ -776,6 +958,12 @@ class MandelbrotWidget(QLabel):
         # Request initial computation
         self.worker.request_computation(self.view)
     
+    def update_colours(self, hue: float, saturation: float, lightness: float) -> None:
+            """Update colour settings and re-render."""
+            self.worker.update_colour_settings(hue, saturation / 100.0, lightness / 100.0)
+            # Re-render current view with new colours
+            self.worker.request_computation(self.view)
+
     def _show_loading_state(self) -> None:
         """Display a placeholder while computing."""
         grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
@@ -1069,6 +1257,22 @@ class MandelbrotWindow(QMainWindow):
         self.mandelbrot_widget = MandelbrotWidget(self.config)
         layout.addWidget(self.mandelbrot_widget)
         
+        # Add colour control sliders
+        from PyQt6.QtWidgets import QFrame
+        slider_container = QWidget()
+        slider_container.setStyleSheet("background-color: #2d2d2d; padding: 5px;")
+        slider_layout = QVBoxLayout(slider_container)
+        slider_layout.setSpacing(5)
+        
+        self.hue_slider, self.sat_slider, self.light_slider = colour_selector(slider_layout)
+        
+        # Connect sliders to update colours
+        self.hue_slider.valueChanged.connect(self._on_colour_changed)
+        self.sat_slider.valueChanged.connect(self._on_colour_changed)
+        self.light_slider.valueChanged.connect(self._on_colour_changed)
+        
+        layout.addWidget(slider_container)
+
         # Create status bar for information display
         self.status_label = QLabel()
         self.status_label.setStyleSheet(
@@ -1100,6 +1304,13 @@ class MandelbrotWindow(QMainWindow):
         # Size window to fit contents
         self.setFixedSize(self.sizeHint())
     
+    def _on_colour_changed(self) -> None:
+        """Handle colour slider changes."""
+        hue = self.hue_slider.value()
+        saturation = self.sat_slider.value()
+        lightness = self.light_slider.value()
+        self.mandelbrot_widget.update_colours(hue, saturation, lightness)
+
     def _update_status(self) -> None:
         """Update the status label with current view information."""
         view = self.mandelbrot_widget.view
