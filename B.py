@@ -6,6 +6,7 @@ centred on mouse position, and precision limit detection.
 """
 
 import sys
+import json
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
@@ -332,6 +333,98 @@ def colour_selector(iterations: np.ndarray, max_iterations: int,
     )
 
 
+def keyboard_shortcuts(key: int) -> Optional[Tuple[str, float]]:
+    """
+    Map keyboard keys to navigation actions.
+    
+    Args:
+        key: Qt key code from the key event.
+        
+    Returns:
+        Tuple of (action_type, value) or None if key not mapped.
+        Action types: 'pan_x', 'pan_y', 'zoom', 'reset'
+        Values: direction/factor for pan/zoom, 0 for reset.
+    """
+    key_mappings = {
+        # WASD panning (value is direction multiplier)
+        Qt.Key.Key_W: ('pan_y', 1.0),   # Pan up (positive imaginary)
+        Qt.Key.Key_S: ('pan_y', -1.0),  # Pan down (negative imaginary)
+        Qt.Key.Key_A: ('pan_x', -1.0),  # Pan left (negative real)
+        Qt.Key.Key_D: ('pan_x', 1.0),   # Pan right (positive real)
+        
+        # QE zooming (value is zoom multiplier)
+        Qt.Key.Key_Q: ('zoom', 0.5),    # Zoom out (decrease zoom level)
+        Qt.Key.Key_E: ('zoom', 2.0),    # Zoom in (increase zoom level)
+        
+        # Reset
+        Qt.Key.Key_R: ('reset', 0.0),   # Reset to initial view
+    }
+    
+    return key_mappings.get(key)
+
+
+def bookmark_system(slot: int, view: Optional[ViewState] = None, 
+                    save: bool = False) -> Optional[ViewState]:
+    """
+    Save or load bookmarks to/from persistent storage.
+    
+    Args:
+        slot: Bookmark slot number (1-5).
+        view: ViewState to save (required if save=True).
+        save: If True, save the view. If False, load the view.
+        
+    Returns:
+        ViewState if loading and bookmark exists, None otherwise.
+    """
+    bookmark_file = Path.home() / '.mandelbrot_bookmarks.json'
+    
+    # Load existing bookmarks
+    bookmarks = {}
+    if bookmark_file.exists():
+        try:
+            with open(bookmark_file, 'r') as f:
+                data = json.load(f)
+                bookmarks = data.get('bookmarks', {})
+        except (json.JSONDecodeError, IOError):
+            bookmarks = {}
+    
+    slot_key = str(slot)
+    
+    if save:
+        # Save bookmark
+        if view is None:
+            return None
+        
+        bookmarks[slot_key] = {
+            'centre_real': view.centre_real,
+            'centre_imag': view.centre_imag,
+            'zoom_level': view.zoom_level,
+            'initial_width': view.initial_width,
+            'initial_height': view.initial_height,
+            'saved_at': datetime.now().isoformat()
+        }
+        
+        try:
+            with open(bookmark_file, 'w') as f:
+                json.dump({'bookmarks': bookmarks}, f, indent=2)
+            return view
+        except IOError:
+            return None
+    else:
+        # Load bookmark
+        if slot_key not in bookmarks:
+            return None
+        
+        data = bookmarks[slot_key]
+        return ViewState(
+            centre_real=data['centre_real'],
+            centre_imag=data['centre_imag'],
+            zoom_level=data['zoom_level'],
+            initial_width=data.get('initial_width', 3.5),
+            initial_height=data.get('initial_height', 2.5)
+        )
+
+
 class TileCache:
    """Cache for computed Mandelbrot tiles."""
    
@@ -567,7 +660,7 @@ class MandelbrotWidget(QLabel):
         
         self.config = config
         self.view = ViewState()
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
         # Mouse tracking state
         self.current_mouse_pos: Optional[QPointF] = None
         self.pan_start_pos: Optional[QPointF] = None
@@ -608,71 +701,91 @@ class MandelbrotWidget(QLabel):
         grey = np.full((self.config.height, self.config.width, 3), 40, dtype=np.uint8)
         self._display_rgb_array(grey)
     
-    def keyboard_shortcuts(self, key: int) -> bool:
+    def save_bookmark(self, slot: int) -> bool:
         """
-        Handle keyboard navigation shortcuts.
+        Save current view to a bookmark slot.
         
         Args:
-            key: Qt key code
+            slot: Bookmark slot number (1-5).
             
         Returns:
-            True if key was handled, False otherwise
+            True if save was successful, False otherwise.
         """
-        # Don't process shortcuts while panning with mouse
-        if self.is_panning:
+        result = bookmark_system(slot, self.view, save=True)
+        return result is not None
+
+    def load_bookmark(self, slot: int) -> bool:
+        """
+        Load view from a bookmark slot.
+        
+        Args:
+            slot: Bookmark slot number (1-5).
+            
+        Returns:
+            True if bookmark exists and was loaded, False otherwise.
+        """
+        view = bookmark_system(slot, save=False)
+        
+        if view is None:
             return False
         
-        # Calculate pan distance (10% of current view)
-        pan_distance_x = self.view.current_width * 0.1
-        pan_distance_y = self.view.current_height * 0.1
+        self.view = view
+        self.worker.request_computation(self.view)
+        return True
+
+    def handle_keyboard_navigation(self, key: int) -> bool:
+        """
+        Process keyboard navigation input.
         
-        handled = True
+        Args:
+            key: Qt key code from the key event.
+            
+        Returns:
+            True if the key was handled, False otherwise.
+        """
+        action = keyboard_shortcuts(key)
         
-        if key == Qt.Key.Key_W:
-            # Pan up (positive imaginary)
-            self.view.centre_imag += pan_distance_y
+        if action is None:
+            return False
+        
+        action_type, value = action
+        
+        # Pan distance as fraction of current view
+        pan_fraction = 0.2
+        
+        if action_type == 'pan_x':
+            # Pan horizontally
+            pan_amount = self.view.current_width * pan_fraction * value
+            self.view.centre_real += pan_amount
             self.worker.request_computation(self.view)
             
-        elif key == Qt.Key.Key_S:
-            # Pan down (negative imaginary)
-            self.view.centre_imag -= pan_distance_y
+        elif action_type == 'pan_y':
+            # Pan vertically
+            pan_amount = self.view.current_height * pan_fraction * value
+            self.view.centre_imag += pan_amount
             self.worker.request_computation(self.view)
             
-        elif key == Qt.Key.Key_A:
-            # Pan left (negative real)
-            self.view.centre_real -= pan_distance_x
+        elif action_type == 'zoom':
+            # Zoom in/out from centre
+            new_zoom = self.view.zoom_level * value
+            
+            # Enforce zoom limits
+            if new_zoom < 1.0:
+                new_zoom = 1.0
+            elif new_zoom > self.max_zoom:
+                new_zoom = self.max_zoom
+                if self.view.zoom_level >= self.max_zoom:
+                    return True
+            
+            self.view.zoom_level = new_zoom
             self.worker.request_computation(self.view)
             
-        elif key == Qt.Key.Key_D:
-            # Pan right (positive real)
-            self.view.centre_real += pan_distance_x
-            self.worker.request_computation(self.view)
-            
-        elif key == Qt.Key.Key_Q:
-            # Zoom in at center
-            new_zoom = self.view.zoom_level * self.zoom_factor
-            
-            if new_zoom <= self.max_zoom:
-                self.view.zoom_level = new_zoom
-                self.worker.request_computation(self.view)
-            
-        elif key == Qt.Key.Key_E:
-            # Zoom out at center
-            new_zoom = self.view.zoom_level / self.zoom_factor
-            
-            if new_zoom >= 1.0:
-                self.view.zoom_level = new_zoom
-                self.worker.request_computation(self.view)
-            
-        elif key == Qt.Key.Key_R:
+        elif action_type == 'reset':
             # Reset to initial view
             self.view = ViewState()
             self.worker.request_computation(self.view)
-            
-        else:
-            handled = False
         
-        return handled
+        return True
 
     def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
         """Convert numpy RGB array to QPixmap and display."""
@@ -816,14 +929,7 @@ class MandelbrotWidget(QLabel):
     def get_current_view(self) -> ViewState:
         """Return a copy of the current view state."""
         return self.view.copy()
-
-    def keyPressEvent(self, event) -> None:
-        """Handle key press events for navigation shortcuts."""
-        if self.keyboard_shortcuts(event.key()):
-            event.accept()
-        else:
-            super().keyPressEvent(event)
-
+    
     def cleanup(self) -> None:
         """Stop the worker thread."""
         self.worker.stop()
@@ -1014,7 +1120,7 @@ class MandelbrotWindow(QMainWindow):
         
         # Create instructions label
         self.instructions_label = QLabel(
-            "Scroll: Zoom  |  Drag: Pan  |  Ctrl+S: Save Image"
+            "Scroll/Q/E: Zoom  |  Drag/WASD: Pan  |  R: Reset  |  1-5: Bookmarks  |  Ctrl+S: Save"
         )
         self.instructions_label.setStyleSheet(
             "padding: 5px; "
@@ -1061,6 +1167,68 @@ class MandelbrotWindow(QMainWindow):
             }
         """
     
+    def _handle_bookmark_key(self, slot: int) -> None:
+        """
+        Handle bookmark save/load for a given slot.
+        
+        Args:
+            slot: Bookmark slot number (1-5).
+        """
+        # Check if bookmark exists
+        existing_bookmark = bookmark_system(slot, save=False)
+        
+        if existing_bookmark is None:
+            # No bookmark in this slot - save current view
+            if self.mandelbrot_widget.save_bookmark(slot):
+                QMessageBox.information(
+                    self,
+                    "Bookmark Saved",
+                    f"Current view saved to bookmark slot {slot}."
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Save Failed",
+                    f"Failed to save bookmark to slot {slot}."
+                )
+        else:
+            # Bookmark exists - prompt to load or overwrite
+            reply = QMessageBox.question(
+                self,
+                "Bookmark Exists",
+                f"Bookmark slot {slot} already exists.\n\n"
+                f"Centre: {existing_bookmark.centre_real:.6g} + {existing_bookmark.centre_imag:.6g}i\n"
+                f"Zoom: {existing_bookmark.zoom_level:.4e}x\n\n"
+                f"Click 'Yes' to load this bookmark.\n"
+                f"Click 'No' to overwrite with current view.",
+                QMessageBox.StandardButton.Yes | 
+                QMessageBox.StandardButton.No | 
+                QMessageBox.StandardButton.Cancel
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Load bookmark
+                if self.mandelbrot_widget.load_bookmark(slot):
+                    QMessageBox.information(
+                        self,
+                        "Bookmark Loaded",
+                        f"Bookmark {slot} loaded successfully."
+                    )
+            elif reply == QMessageBox.StandardButton.No:
+                # Overwrite bookmark
+                if self.mandelbrot_widget.save_bookmark(slot):
+                    QMessageBox.information(
+                        self,
+                        "Bookmark Overwritten",
+                        f"Bookmark slot {slot} has been overwritten with current view."
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Save Failed",
+                        f"Failed to overwrite bookmark in slot {slot}."
+                    )
+
     def _on_colour_changed(self) -> None:
         """Handle colour slider changes."""
         hue = self.hue_slider.value() / 100.0
@@ -1097,18 +1265,37 @@ class MandelbrotWindow(QMainWindow):
     
     def keyPressEvent(self, event) -> None:
         """Handle keyboard shortcuts."""
-        # Check for Ctrl+S save shortcut
+        # Ctrl+S to save
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             if event.key() == Qt.Key.Key_S:
                 self._save_image()
-                event.accept()
                 return
         
-        # Forward navigation shortcuts to widget
-        if self.mandelbrot_widget.keyboard_shortcuts(event.key()):
-            event.accept()
-        else:
-            super().keyPressEvent(event)
+        # Handle navigation keys (only when no modifiers pressed)
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            # Bookmark keys (1-5)
+            if event.key() == Qt.Key.Key_1:
+                self._handle_bookmark_key(1)
+                return
+            elif event.key() == Qt.Key.Key_2:
+                self._handle_bookmark_key(2)
+                return
+            elif event.key() == Qt.Key.Key_3:
+                self._handle_bookmark_key(3)
+                return
+            elif event.key() == Qt.Key.Key_4:
+                self._handle_bookmark_key(4)
+                return
+            elif event.key() == Qt.Key.Key_5:
+                self._handle_bookmark_key(5)
+                return
+            
+            # Navigation keys
+            if self.mandelbrot_widget.handle_keyboard_navigation(event.key()):
+                return
+        
+        super().keyPressEvent(event)
+        
     
     def _save_image(self) -> None:
         """Open save dialog and save current view."""

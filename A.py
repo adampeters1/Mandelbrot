@@ -7,6 +7,7 @@ centred on mouse position, and precision limit detection.
 
 import sys
 import numpy as np
+import json
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
 from datetime import datetime
@@ -15,7 +16,7 @@ import hashlib
 
 from PyQt6.QtWidgets import (
    QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout,
-   QWidget, QFileDialog, QMessageBox, QSlider, QGroupBox
+   QWidget, QFileDialog, QMessageBox, QSlider, QGroupBox, QInputDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF, QMutex, QWaitCondition
 from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QWheelEvent
@@ -690,6 +691,18 @@ class MandelbrotWidget(QLabel):
         
         return True
 
+    def load_bookmark(self, bookmark: Dict) -> None:
+        """
+        Load a view state from a bookmark.
+        
+        Args:
+            bookmark: Dict containing 'centre_real', 'centre_imag', 'zoom_level'.
+        """
+        self.view.centre_real = bookmark['centre_real']
+        self.view.centre_imag = bookmark['centre_imag']
+        self.view.zoom_level = bookmark['zoom_level']
+        self.worker.request_computation(self.view)
+
     def _display_rgb_array(self, rgb_array: np.ndarray) -> None:
         """Convert numpy RGB array to QPixmap and display."""
         height, width, channels = rgb_array.shape
@@ -917,6 +930,105 @@ class ImageSaver:
        return f"mandelbrot_{timestamp}_zoom{zoom_str}.png"
 
 
+class BookmarkManager:
+    """
+    Manages persistent bookmarks for Mandelbrot set positions.
+    
+    Stores up to 5 bookmarks in a JSON file, each containing
+    view state and a user-provided name.
+    """
+    
+    MAX_BOOKMARKS = 5
+    FILENAME = "mandelbrot_bookmarks.json"
+    
+    def __init__(self):
+        self.filepath = Path.home() / ".config" / self.FILENAME
+        self.bookmarks: Dict[int, Dict] = {}
+        self._load()
+    
+    def _load(self) -> None:
+        """Load bookmarks from disk."""
+        try:
+            if self.filepath.exists():
+                with open(self.filepath, 'r') as f:
+                    data = json.load(f)
+                    # Convert string keys back to integers
+                    self.bookmarks = {int(k): v for k, v in data.items()}
+        except (json.JSONDecodeError, IOError):
+            self.bookmarks = {}
+    
+    def _save(self) -> None:
+        """Save bookmarks to disk."""
+        try:
+            self.filepath.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.filepath, 'w') as f:
+                json.dump(self.bookmarks, f, indent=2)
+        except IOError as e:
+            print(f"Failed to save bookmarks: {e}")
+    
+    def get(self, slot: int) -> Optional[Dict]:
+        """
+        Retrieve a bookmark by slot number.
+        
+        Args:
+            slot: Slot number (1-5).
+            
+        Returns:
+            Bookmark dict with 'name', 'centre_real', 'centre_imag', 'zoom_level'
+            or None if slot is empty.
+        """
+        return self.bookmarks.get(slot)
+    
+    def save(self, slot: int, name: str, view: ViewState) -> None:
+        """
+        Save a bookmark to a slot.
+        
+        Args:
+            slot: Slot number (1-5).
+            name: User-provided name for the bookmark.
+            view: ViewState to save.
+        """
+        self.bookmarks[slot] = {
+            'name': name,
+            'centre_real': view.centre_real,
+            'centre_imag': view.centre_imag,
+            'zoom_level': view.zoom_level
+        }
+        self._save()
+    
+    def get_empty_slot(self) -> Optional[int]:
+        """
+        Find the first empty slot.
+        
+        Returns:
+            Slot number (1-5) or None if all slots are full.
+        """
+        for slot in range(1, self.MAX_BOOKMARKS + 1):
+            if slot not in self.bookmarks:
+                return slot
+        return None
+    
+    def get_all(self) -> Dict[int, Dict]:
+        """Return all bookmarks."""
+        return self.bookmarks.copy()
+    
+    def delete(self, slot: int) -> bool:
+        """
+        Delete a bookmark from a slot.
+        
+        Args:
+            slot: Slot number (1-5).
+            
+        Returns:
+            True if bookmark was deleted, False if slot was empty.
+        """
+        if slot in self.bookmarks:
+            del self.bookmarks[slot]
+            self._save()
+            return True
+        return False
+
+
 class MandelbrotWindow(QMainWindow):
     """Main application window with save functionality."""
     
@@ -931,7 +1043,9 @@ class MandelbrotWindow(QMainWindow):
             height=600,
             max_iterations=256
         )
-        
+
+        self.bookmark_manager = BookmarkManager()
+
         # Create central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1023,7 +1137,8 @@ class MandelbrotWindow(QMainWindow):
         
         # Create instructions label
         self.instructions_label = QLabel(
-            "Scroll/Q/E: Zoom  |  Drag/WASD: Pan  |  R: Reset  |  Ctrl+S: Save"
+            "Scroll/Q/E: Zoom  |  Drag/WASD: Pan  |  R: Reset  |  "
+            "1-5: Load/Save Bookmark  |  Shift+1-5: Save  |  Ctrl+S: Save Image"
         )
         self.instructions_label.setStyleSheet(
             "padding: 5px; "
@@ -1044,6 +1159,99 @@ class MandelbrotWindow(QMainWindow):
         self.adjustSize()
         self.setMinimumSize(self.sizeHint())
     
+    def _handle_bookmark_key(self, slot: int) -> None:
+        """
+        Handle bookmark key press (1-5).
+        
+        Shift+number saves, number alone loads.
+        
+        Args:
+            slot: Bookmark slot number (1-5).
+        """
+        bookmark = self.bookmark_manager.get(slot)
+    
+        if bookmark:
+            # Load existing bookmark
+            self.mandelbrot_widget.load_bookmark(bookmark)
+            self._show_status_message(f"Loaded: {bookmark['name']}")
+        else:
+            # Empty slot - prompt to save
+            self._save_bookmark_to_slot(slot)
+
+    def _save_bookmark(self) -> None:
+        """Initiate saving a bookmark, finding a slot or prompting for overwrite."""
+        empty_slot = self.bookmark_manager.get_empty_slot()
+        
+        if empty_slot:
+            self._save_bookmark_to_slot(empty_slot)
+        else:
+            self._prompt_overwrite_bookmark()
+
+    def _save_bookmark_to_slot(self, slot: int) -> None:
+        """
+        Save current view to a specific slot.
+        
+        Args:
+            slot: Slot number (1-5).
+        """
+        
+        view = self.mandelbrot_widget.get_current_view()
+        default_name = f"Zoom {view.zoom_level:.2e}x"
+        
+        name, ok = QInputDialog.getText(
+            self,
+            f"Save Bookmark (Slot {slot})",
+            "Enter bookmark name:",
+            text=default_name
+        )
+        
+        if ok and name.strip():
+            self.bookmark_manager.save(slot, name.strip(), view)
+            self._show_status_message(f"Saved to slot {slot}: {name.strip()}")
+
+    def _prompt_overwrite_bookmark(self) -> None:
+        """Show dialog to select which bookmark slot to overwrite."""
+        from PyQt6.QtWidgets import QInputDialog
+        
+        bookmarks = self.bookmark_manager.get_all()
+        
+        # Build list of current bookmarks
+        choices = []
+        for slot in range(1, BookmarkManager.MAX_BOOKMARKS + 1):
+            if slot in bookmarks:
+                name = bookmarks[slot]['name']
+                zoom = bookmarks[slot]['zoom_level']
+                choices.append(f"{slot}: {name} (Zoom: {zoom:.2e}x)")
+        
+        choice, ok = QInputDialog.getItem(
+            self,
+            "All Slots Full",
+            "Select a bookmark to overwrite:",
+            choices,
+            0,
+            False
+        )
+        
+        if ok and choice:
+            # Extract slot number from choice string
+            slot = int(choice.split(':')[0])
+            self._save_bookmark_to_slot(slot)
+
+    def _show_status_message(self, message: str) -> None:
+        """
+        Temporarily show a message in the status bar.
+        
+        Args:
+            message: Message to display.
+        """
+        from PyQt6.QtCore import QTimer
+        
+        original_text = self.status_label.text()
+        self.status_label.setText(f"  {message}")
+        
+        # Restore original status after 2 seconds
+        QTimer.singleShot(2000, lambda: self._update_status())
+
     def _slider_style(self) -> str:
         """Return stylesheet for sliders."""
         return """
@@ -1106,18 +1314,51 @@ class MandelbrotWindow(QMainWindow):
     
     def keyPressEvent(self, event) -> None:
         """Handle keyboard shortcuts."""
-        # Ctrl+S to save
+        # Ctrl+S to save image
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             if event.key() == Qt.Key.Key_S:
                 self._save_image()
                 return
         
-        # Handle navigation keys (only when no modifiers pressed)
+        # Shift+number to save bookmark
+        if event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+            slot = self._key_to_slot(event.key())
+            if slot:
+                self._save_bookmark_to_slot(slot)
+                return
+        
+        # Handle navigation and bookmark keys (no modifiers)
         if event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            # Check for bookmark keys (1-5)
+            slot = self._key_to_slot(event.key())
+            if slot:
+                self._handle_bookmark_key(slot)
+                return
+            
+            # Check for navigation keys
             if self.mandelbrot_widget.handle_keyboard_navigation(event.key()):
                 return
         
         super().keyPressEvent(event)
+
+    def _key_to_slot(self, key: int) -> Optional[int]:
+        """
+        Convert a key code to a bookmark slot number.
+        
+        Args:
+            key: Qt key code.
+            
+        Returns:
+            Slot number (1-5) or None if not a bookmark key.
+        """
+        key_to_slot_map = {
+            Qt.Key.Key_1: 1,
+            Qt.Key.Key_2: 2,
+            Qt.Key.Key_3: 3,
+            Qt.Key.Key_4: 4,
+            Qt.Key.Key_5: 5,
+        }
+        return key_to_slot_map.get(key)
         
     
     def _save_image(self) -> None:
